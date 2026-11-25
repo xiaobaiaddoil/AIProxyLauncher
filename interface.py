@@ -134,7 +134,7 @@ class LauncherWindow:
         root = self.root
         root.title("AI 代理启动器")
         icon = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "launcher.ico"
-        if not IS_MAC and icon.is_file():
+        if sys.platform == "win32" and icon.is_file():
             root.iconbitmap(default=str(icon))
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         win_w = min(self.px(1050), sw - 48)
