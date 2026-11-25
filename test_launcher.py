@@ -914,7 +914,11 @@ Active Routes:
         self.assertGreaterEqual(len(dialogs.USER_GUIDE_SECTIONS), 5)
         self.assertTrue(any("右上角" in bullet for _, _, bullets in dialogs.USER_GUIDE_SECTIONS for bullet in bullets))
 
-        with tempfile.TemporaryDirectory() as temp, patch.object(interface, "DATA", Path(temp)):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(interface, "DATA", Path(temp)), \
+                patch.object(interface, "system_proxy_port", return_value=None), \
+                patch.object(interface, "detect_paths", return_value={}), \
+                patch.object(interface, "detected_proxy_apps", return_value={}):
             try:
                 root = tk.Tk()
             except tk.TclError:
