@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Build & local release staging artifacts (distributed via GitHub Releases)
+build/
+dist/
+*.spec
+新版/
+构建输出/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.bak
+*.ai-proxy-launcher.bak
+.vscode/
+.idea/
+

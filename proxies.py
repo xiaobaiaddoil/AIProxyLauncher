@@ -1,0 +1,1208 @@
+"""Universal local proxy discovery, process attribution, and OS-level TUN detection."""
+from __future__ import annotations
+
+import concurrent.futures
+import ctypes
+from ctypes import wintypes
+from dataclasses import dataclass, field
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import time
+
+if sys.platform == "win32":
+    import winreg
+import macos
+import win32net
+
+
+HOME = Path.home()
+LOCAL = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData/Local"))
+ROAMING = Path(os.environ.get("APPDATA", HOME / "AppData/Roaming"))
+WINDOWS = Path(os.environ.get("SystemRoot", "C:/Windows"))
+CLASH_HOME = ROAMING / "io.github.clash-verge-rev.clash-verge-rev"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+PIPE_PREFIX = "\\\\.\\pipe\\"
+PIPE_NAME = re.compile(r"(?:[a-zA-Z0-9_-]{1,64}\\){0,2}[a-zA-Z0-9_-]{1,160}")
+RESTRICTED_AI_REGIONS = {"CN", "HK", "MO", "RU", "BY", "KP", "IR", "SY", "CU"}
+REGION_NAMES = {
+    "US": "美国", "JP": "日本", "TW": "台湾", "SG": "新加坡", "HK": "香港",
+    "MO": "澳门", "CN": "中国", "GB": "英国", "DE": "德国", "FR": "法国",
+    "NL": "荷兰", "CA": "加拿大", "KR": "韩国", "AU": "澳大利亚", "IN": "印度",
+    "SE": "瑞典", "CH": "瑞士", "IE": "爱尔兰", "FI": "芬兰", "IT": "意大利",
+    "ES": "西班牙", "PL": "波兰", "BR": "巴西", "RU": "俄罗斯", "TR": "土耳其",
+    "MY": "马来西亚", "TH": "泰国", "VN": "越南", "PH": "菲律宾", "ID": "印度尼西亚",
+}
+RESTRICTED_NODE_TOKENS = (
+    "香港", "hong kong", "hongkong", "🇭🇰", "中国", "china", "🇨🇳",
+    "澳门", "macau", "macao", "🇲🇴", "俄罗斯", "russia", "🇷🇺",
+)
+LOCAL_CONTROLLER_ADDR = re.compile(
+    r"^(?:127\.0\.0\.1|localhost|0\.0\.0\.0|\[::1\]|\[::\]|):([0-9]{1,5})$",
+    re.I,
+)
+LOCAL_BIND_IPS = {"127.0.0.1", "0.0.0.0", "[::1]", "[::]", "::1", "::", "*"}
+CLASH_CONFIG_KEYS = {"mode", "port", "mixed-port", "socks-port", "redir-port", "tproxy-port", "allow-lan", "tun"}
+GENERIC_EXECUTABLES = {
+    "cmd.exe", "powershell.exe", "pwsh.exe", "conhost.exe", "explorer.exe", "svchost.exe",
+    "services.exe", "wininit.exe", "system", "node.exe", "python.exe", "pythonw.exe",
+    "windowsterminal.exe", "openconsole.exe", "launchd", "bash", "zsh", "sh", "fish",
+    "terminal", "iterm2", "python3", "node", "systemd",
+}
+TUN_ADAPTER_PATTERN = re.compile(
+    r"(?:wintun|mihomo|meta\s+tunnel|clash|sing-?tun|sing-?box|v2rayn?|hiddify|"
+    r"nekobox|nekoray|karing|flclash|wireguard|outline|surge|stash|\butun\d*|\btun\d*|tap-windows)",
+    re.I,
+)
+IPV4_ROUTE_ROW = re.compile(
+    r"^\s*(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\S+)\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+)\s*$"
+)
+PROXY_PIPE_PATTERNS = (
+    ("verge-mihomo", "Clash Verge Rev"),
+    ("clashparty", "Clash Party"),
+    ("mihomoparty", "Clash Party"),
+    ("nyanpasu", "Clash Nyanpasu"),
+    ("sparkle", "Sparkle"),
+    ("flclash", "FlClash"),
+    ("clashmi", "Clash Mi"),
+    ("mihomo", "Mihomo"),
+    ("clash-meta", "Clash"),
+    ("clash-rs", "Clash"),
+)
+
+
+@dataclass(frozen=True)
+class Controller:
+    pipe: str = ""
+    port: int | None = None
+    secret: str = field(default="", repr=False)
+    name: str = ""
+    unix: str = ""
+
+
+JIMMM_CONTROLLER = Controller(pipe=r"MihomoParty\mihomo")
+
+
+@dataclass(frozen=True)
+class ProxyProfile:
+    name: str
+    family: str  # "clash", "singbox", "v2ray", "http"
+    win_exes: tuple[str, ...] = ()
+    win_cores: tuple[str, ...] = ()
+    mac_apps: tuple[str, ...] = ()
+    mac_procs: tuple[str, ...] = ()
+    registry_names: tuple[str, ...] = ()
+    win_dirs: tuple[str, ...] = ()
+    default_ports: tuple[int, ...] = ()
+    standalone_core: bool = False
+
+
+PROFILES: tuple[ProxyProfile, ...] = (
+    ProxyProfile(
+        "Clash Verge Rev", "clash",
+        win_exes=("clash-verge.exe",),
+        win_cores=("verge-mihomo.exe", "verge-mihomo-alpha.exe", "clash-meta.exe", "clash-meta-alpha.exe"),
+        mac_apps=("Clash Verge", "Clash Verge Rev"),
+        mac_procs=("clash-verge", "verge-mihomo", "verge-mihomo-alpha"),
+        registry_names=("clash verge", "clash verge rev"),
+        win_dirs=("Clash Verge", "Clash Verge Rev"),
+        default_ports=(7897, 7890),
+    ),
+    ProxyProfile(
+        "Clash Party", "clash",
+        win_exes=("Clash Party.exe", "Mihomo Party.exe", "clash-party.exe", "mihomo-party.exe"),
+        win_cores=("mihomo.exe", "mihomo-alpha.exe"),
+        mac_apps=("Clash Party", "Mihomo Party"),
+        mac_procs=("Clash Party", "Mihomo Party", "clash-party", "mihomo-party"),
+        registry_names=("clash party", "mihomo party"),
+        win_dirs=("Clash Party", "Mihomo Party", "clash-party", "mihomo-party"),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "JImmm", "clash",
+        win_exes=("Jimmm.exe",),
+        win_cores=("mihomo.exe", "mihomo-alpha.exe"),
+        mac_apps=("Jimmm", "JImmm"),
+        mac_procs=("Jimmm", "JImmm"),
+        registry_names=("jimmm",),
+        win_dirs=("Jimmm",),
+        default_ports=(9674,),
+    ),
+    ProxyProfile(
+        "FlClash", "clash",
+        win_exes=("FlClash.exe",),
+        win_cores=("FlClashCore.exe",),
+        mac_apps=("FlClash",),
+        mac_procs=("FlClash", "FlClashCore"),
+        registry_names=("flclash",),
+        win_dirs=("FlClash",),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "Clash Nyanpasu", "clash",
+        win_exes=("Clash Nyanpasu.exe", "clash-nyanpasu.exe"),
+        win_cores=("nyanpasu-mihomo.exe", "mihomo.exe", "mihomo-alpha.exe", "clash-rs.exe"),
+        mac_apps=("Clash Nyanpasu",),
+        mac_procs=("Clash Nyanpasu", "clash-nyanpasu"),
+        registry_names=("clash nyanpasu",),
+        win_dirs=("Clash Nyanpasu", "clash-nyanpasu"),
+        default_ports=(7890, 7897),
+    ),
+    ProxyProfile(
+        "Sparkle", "clash",
+        win_exes=("Sparkle.exe", "sparkle.exe"),
+        win_cores=("mihomo.exe", "mihomo-alpha.exe"),
+        mac_apps=("Sparkle",),
+        mac_procs=("Sparkle", "sparkle"),
+        registry_names=("sparkle",),
+        win_dirs=("Sparkle",),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "Clash Mi", "clash",
+        win_exes=("ClashMi.exe", "clashmi.exe"),
+        win_cores=("mihomo.exe",),
+        mac_apps=("Clash Mi", "ClashMi"),
+        mac_procs=("Clash Mi", "ClashMi", "clashmi"),
+        registry_names=("clash mi", "clashmi"),
+        win_dirs=("ClashMi", "Clash Mi"),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "Clash for Windows", "clash",
+        win_exes=("Clash for Windows.exe",),
+        win_cores=("clash-win64.exe", "clash-win32.exe", "clash-win64-v3.exe", "clash.exe"),
+        registry_names=("clash for windows",),
+        win_dirs=("Clash for Windows",),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "ClashX", "clash",
+        mac_apps=("ClashX", "ClashX Pro", "ClashX Meta"),
+        mac_procs=("ClashX", "ClashX Pro", "ClashX Meta", "ProxyConfigManager"),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "Stash", "clash",
+        mac_apps=("Stash",),
+        mac_procs=("Stash",),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "GUI.for.Clash", "clash",
+        win_exes=("GUI.for.Clash.exe",),
+        win_cores=("mihomo-windows-amd64.exe", "mihomo-windows-amd64-v3.exe", "mihomo.exe"),
+        mac_apps=("GUI.for.Clash",),
+        mac_procs=("GUI.for.Clash",),
+        registry_names=("gui.for.clash",),
+        win_dirs=("GUI.for.Clash",),
+        default_ports=(20122, 7890),
+    ),
+    ProxyProfile(
+        "v2rayN", "v2ray",
+        win_exes=("v2rayN.exe",),
+        win_cores=("xray.exe", "sing-box.exe", "v2ray.exe", "mihomo.exe", "hysteria.exe", "naive.exe"),
+        mac_apps=("v2rayN",),
+        mac_procs=("v2rayN",),
+        registry_names=("v2rayn",),
+        win_dirs=("v2rayN",),
+        default_ports=(10808, 10809),
+    ),
+    ProxyProfile(
+        "V2rayU", "v2ray",
+        mac_apps=("V2rayU", "V2RayXS", "V2RayX"),
+        mac_procs=("V2rayU", "V2RayXS", "V2RayX", "v2ray-core"),
+        default_ports=(1087, 10809),
+    ),
+    ProxyProfile(
+        "Hiddify", "singbox",
+        win_exes=("Hiddify.exe",),
+        win_cores=("HiddifyCli.exe",),
+        mac_apps=("Hiddify",),
+        mac_procs=("Hiddify", "HiddifyCli"),
+        registry_names=("hiddify", "hiddify next"),
+        win_dirs=("Hiddify", "Hiddify Next"),
+        default_ports=(12334,),
+    ),
+    ProxyProfile(
+        "NekoBox", "singbox",
+        win_exes=("nekobox.exe", "nekoray.exe", "Throne.exe"),
+        win_cores=("nekobox_core.exe", "nekoray_core.exe", "ThroneCore.exe", "sing-box.exe"),
+        mac_apps=("NekoBox", "NekoRay", "Throne"),
+        mac_procs=("nekobox", "nekoray", "Throne", "nekobox_core", "nekoray_core", "ThroneCore"),
+        registry_names=("nekobox", "nekoray", "throne"),
+        win_dirs=("nekobox", "nekoray", "Throne"),
+        default_ports=(2080, 2081),
+    ),
+    ProxyProfile(
+        "Karing", "singbox",
+        win_exes=("karing.exe",),
+        win_cores=("karingService.exe",),
+        mac_apps=("Karing",),
+        mac_procs=("Karing", "karing", "karingService"),
+        registry_names=("karing",),
+        win_dirs=("Karing",),
+        default_ports=(3067, 7890),
+    ),
+    ProxyProfile(
+        "GUI.for.SingBox", "singbox",
+        win_exes=("GUI.for.SingBox.exe",),
+        win_cores=("sing-box.exe",),
+        mac_apps=("GUI.for.SingBox", "SFM"),
+        mac_procs=("GUI.for.SingBox", "SFM"),
+        registry_names=("gui.for.singbox",),
+        win_dirs=("GUI.for.SingBox",),
+        default_ports=(20122, 7890, 10808),
+    ),
+    ProxyProfile(
+        "Surge", "http",
+        mac_apps=("Surge",),
+        mac_procs=("Surge", "Surge Helper"),
+        default_ports=(6152,),
+    ),
+    ProxyProfile(
+        "V2Box", "http",
+        mac_apps=("V2Box",),
+        mac_procs=("V2Box",),
+        default_ports=(10809, 7890),
+    ),
+    ProxyProfile(
+        "Loon", "http",
+        mac_apps=("Loon",),
+        mac_procs=("Loon",),
+        default_ports=(7890,),
+    ),
+    ProxyProfile(
+        "Shadowsocks", "http",
+        win_exes=("Shadowsocks.exe", "ShadowsocksR-dotnet4.0.exe", "ss-local.exe", "sslocal.exe"),
+        win_cores=("privoxy.exe", "ss-local.exe", "sslocal.exe"),
+        mac_apps=("ShadowsocksX-NG", "ShadowsocksX-NG-R8"),
+        mac_procs=("ShadowsocksX-NG", "ShadowsocksX-NG-R8", "ss-local", "sslocal", "privoxy"),
+        registry_names=("shadowsocks",),
+        win_dirs=("Shadowsocks",),
+        default_ports=(1080, 1087),
+    ),
+    ProxyProfile(
+        "Mihomo", "clash",
+        win_exes=("mihomo.exe", "mihomo-alpha.exe", "clash-meta.exe", "clash.exe", "clash-rs.exe"),
+        mac_procs=("mihomo", "mihomo-alpha", "clash-meta", "clash", "clash-rs"),
+        registry_names=("mihomo",),
+        default_ports=(7890,),
+        standalone_core=True,
+    ),
+    ProxyProfile(
+        "sing-box", "singbox",
+        win_exes=("sing-box.exe",),
+        mac_apps=("sing-box",),
+        mac_procs=("sing-box",),
+        default_ports=(7890, 10808),
+        standalone_core=True,
+    ),
+    ProxyProfile(
+        "Xray", "v2ray",
+        win_exes=("xray.exe", "v2ray.exe"),
+        mac_procs=("xray", "v2ray"),
+        default_ports=(10808, 10809),
+        standalone_core=True,
+    ),
+    ProxyProfile(
+        "Privoxy", "http",
+        win_exes=("privoxy.exe", "trojan.exe", "trojan-go.exe", "hysteria.exe", "naive.exe", "gost.exe"),
+        mac_procs=("privoxy", "trojan", "trojan-go", "hysteria", "naive", "gost"),
+        default_ports=(8118,),
+        standalone_core=True,
+    ),
+)
+
+PROFILE_BY_NAME: dict[str, ProxyProfile] = {profile.name: profile for profile in PROFILES}
+STANDALONE_CORES: set[str] = {profile.name for profile in PROFILES if profile.standalone_core}
+
+_GUI_PROC_MAP: dict[str, str] = {}
+_CORE_PROC_MAP: dict[str, str] = {}
+_REGISTRY_MAP: dict[str, ProxyProfile] = {}
+for _profile in PROFILES:
+    for _reg in _profile.registry_names:
+        _REGISTRY_MAP[_reg.casefold()] = _profile
+    if not _profile.standalone_core:
+        for _exe in (*_profile.win_exes, *_profile.mac_procs):
+            _GUI_PROC_MAP.setdefault(_exe.casefold(), _profile.name)
+        for _core in _profile.win_cores:
+            # Shared cores like mihomo.exe or sing-box.exe should fall back to standalone core unless parent matches.
+            if _core.casefold() not in {"mihomo.exe", "mihomo-alpha.exe", "sing-box.exe", "xray.exe", "v2ray.exe",
+                                        "hysteria.exe", "naive.exe", "privoxy.exe"}:
+                _CORE_PROC_MAP.setdefault(_core.casefold(), _profile.name)
+    else:
+        for _exe in (*_profile.win_exes, *_profile.mac_procs):
+            _CORE_PROC_MAP.setdefault(_exe.casefold(), _profile.name)
+
+
+@dataclass(frozen=True)
+class HTTPProxyCandidate:
+    port: int
+    name: str
+    source: str  # "system", "env", "process", "manual"
+    pid: int | None = None
+
+
+@dataclass(frozen=True)
+class DiscoverySnapshot:
+    controllers: list[Controller]
+    http_proxies: list[HTTPProxyCandidate]
+    detected_apps: dict[str, Path | None]
+    hints: list[str]
+    controller_sibling_ports: dict[Controller, list[int]] = field(default_factory=dict)
+
+
+def parse_local_controller_port(address: str) -> int | None:
+    match = LOCAL_CONTROLLER_ADDR.fullmatch(address.strip())
+    if match and 1 <= int(match[1]) <= 65535:
+        return int(match[1])
+    return None
+
+
+def parse_local_http_proxy_port(value: str) -> int | None:
+    match = re.fullmatch(r"(?:https?://)?(?:127\.0\.0\.1|localhost|\[::1\]):([0-9]{1,5})/?", value.strip(), re.I)
+    if match and 1 <= int(match[1]) <= 65535:
+        return int(match[1])
+    return None
+
+
+def env_proxy_ports(env: dict[str, str] | None = None) -> list[int]:
+    source = os.environ if env is None else env
+    by_upper = {key.upper(): value for key, value in source.items() if isinstance(value, str)}
+    ports = []
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"):
+        raw = by_upper.get(key, "").strip()
+        if not raw or raw.lower().startswith("socks"):
+            continue
+        port = parse_local_http_proxy_port(raw)
+        if port and port not in ports:
+            ports.append(port)
+    return ports
+
+
+def identify_process_proxy(pid: int, processes: dict[int, tuple[str, int]]) -> str | None:
+    """Walk the process tree from pid upward to identify the owning proxy client name."""
+    core_match = None
+    current = pid
+    visited = set()
+    for _ in range(8):
+        if current not in processes or current in visited:
+            break
+        visited.add(current)
+        name, parent = processes[current]
+        folded = name.casefold()
+        if folded in _GUI_PROC_MAP:
+            return _GUI_PROC_MAP[folded]
+        if core_match is None and folded in _CORE_PROC_MAP:
+            core_match = _CORE_PROC_MAP[folded]
+        current = parent
+    return core_match
+
+
+def fallback_process_label(pid: int, processes: dict[int, tuple[str, int]], default: str = "系统代理") -> str:
+    known = identify_process_proxy(pid, processes)
+    if known:
+        return known
+    current = pid
+    visited = set()
+    chosen = ""
+    for _ in range(6):
+        if current not in processes or current in visited:
+            break
+        visited.add(current)
+        name, parent = processes[current]
+        folded = name.casefold()
+        if not folded or folded in GENERIC_EXECUTABLES:
+            if chosen:
+                break
+        else:
+            stem = Path(name).stem.strip()
+            if stem:
+                chosen = stem
+        current = parent
+    return chosen or default
+
+
+def process_executable_path(pid: int) -> Path | None:
+    """Return the executable path for a Windows PID without spawning a subprocess."""
+    if sys.platform != "win32" or pid <= 0:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    )
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(size.value)
+        if kernel.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            path = Path(buf.value)
+            if path.is_file():
+                return path
+    except OSError:
+        pass
+    finally:
+        kernel.CloseHandle(handle)
+    return None
+
+
+def parse_windows_listening_ports(output: str) -> list[tuple[int, str, int]]:
+    seen: dict[tuple[int, int], str] = {}
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) != 5 or parts[0].upper() != "TCP" or parts[3].upper() != "LISTENING":
+            continue
+        local_ip, sep, port_text = parts[1].rpartition(":")
+        if not sep or local_ip not in LOCAL_BIND_IPS or not port_text.isdigit() or not parts[4].isdigit():
+            continue
+        port = int(port_text)
+        pid = int(parts[4])
+        if not (1 <= port <= 65535) or pid <= 0:
+            continue
+        key = (pid, port)
+        if key not in seen or local_ip in {"127.0.0.1", "[::1]"}:
+            seen[key] = local_ip
+    return [(pid, ip, port) for (pid, port), ip in seen.items()]
+
+
+def listening_tcp_ports(is_mac: bool = False) -> list[tuple[int, str, int]]:
+    if is_mac:
+        return macos.listening_tcp_ports()
+    native = win32net.windows_tcp_tables()
+    if native is not None:
+        return native[1]
+    try:
+        output = subprocess.check_output(
+            [str(WINDOWS / "System32/netstat.exe"), "-ano"],
+            timeout=5, creationflags=NO_WINDOW,
+        ).decode("ascii", errors="replace")
+        return parse_windows_listening_ports(output)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def parse_windows_tun_routes(output: str) -> bool:
+    has_tun_adapter = False
+    defaults: list[tuple[str, int]] = []
+    split_zero: set[str] = set()
+    split_high: set[str] = set()
+    fake_ip_ifaces: set[str] = set()
+    excluded = ("netease uu", "uu tap", "vmware", "virtualbox", "hyper-v", "wsl")
+
+    for line in output.splitlines():
+        match = IPV4_ROUTE_ROW.match(line)
+        if match:
+            dest, mask, _gateway, iface, metric_text = match.groups()
+            metric = int(metric_text)
+            if dest == "0.0.0.0" and mask == "0.0.0.0":
+                defaults.append((iface, metric))
+            elif dest == "0.0.0.0" and mask == "128.0.0.0":
+                split_zero.add(iface)
+            elif dest == "128.0.0.0" and mask == "128.0.0.0":
+                split_high.add(iface)
+            elif dest.startswith("198.18.") or iface.startswith(("198.18.", "198.19.")):
+                fake_ip_ifaces.add(iface)
+        elif not any(token in line.casefold() for token in excluded) and TUN_ADAPTER_PATTERN.search(line):
+            has_tun_adapter = True
+
+    # Split-default routes (0.0.0.0/1 + 128.0.0.0/1) on the same interface are a standard TUN takeover.
+    if split_zero & split_high:
+        return True
+    # Fake-IP interface (198.18.x.x) paired with a default route or active TUN interface.
+    if fake_ip_ifaces and (any(iface in fake_ip_ifaces for iface, _ in defaults) or has_tun_adapter):
+        return True
+    if not has_tun_adapter or not defaults:
+        return False
+    best_metric = min(metric for _, metric in defaults)
+    tun_prefixes = ("198.18.", "198.19.", "172.19.", "172.18.", "10.0.85.")
+    return any(iface.startswith(tun_prefixes) and metric <= best_metric for iface, metric in defaults)
+
+
+def detect_system_tun(is_mac: bool = False) -> bool:
+    if is_mac:
+        return macos.detect_system_tun()
+    try:
+        output = subprocess.check_output(
+            [str(WINDOWS / "System32/route.exe"), "print", "-4"],
+            timeout=4, creationflags=NO_WINDOW,
+        ).decode("mbcs", errors="replace")
+        return parse_windows_tun_routes(output)
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def config_files(is_mac: bool = False) -> list[tuple[str, Path]]:
+    if is_mac:
+        return macos.config_files()
+    party_roots = [
+        ("JImmm", ROAMING / "Jimmm"),
+        ("Clash Party", ROAMING / "clash-party"),
+        ("Clash Party", ROAMING / "mihomo-party"),
+        ("Sparkle", ROAMING / "sparkle"),
+    ]
+    files: list[tuple[str, Path]] = [
+        ("Clash Verge Rev", CLASH_HOME / "clash-verge.yaml"),
+        ("Clash Verge Rev", CLASH_HOME / "config.yaml"),
+        ("Clash Nyanpasu", ROAMING / "clash-nyanpasu/clash-config.yaml"),
+        ("Clash Nyanpasu", ROAMING / "clash-nyanpasu/config.yaml"),
+        ("Clash Nyanpasu", LOCAL / "clash-nyanpasu/clash-config.yaml"),
+        ("Clash for Windows", HOME / ".config/clash/config.yaml"),
+        ("Clash for Windows", ROAMING / "clash_win/config.yaml"),
+        ("FlClash", ROAMING / "com.follow.clash/config.yaml"),
+        ("FlClash", ROAMING / "FlClash/config.yaml"),
+        ("Clash Mi", ROAMING / "clashmi/config.yaml"),
+        ("Mihomo", HOME / ".config/mihomo/config.yaml"),
+        ("Mihomo", ROAMING / "mihomo/config.yaml"),
+        ("Hiddify", ROAMING / "Hiddify/hiddify/current-config.json"),
+        ("Hiddify", ROAMING / "app.hiddify.com/hiddify/current-config.json"),
+        ("Hiddify", ROAMING / "Hiddify/current-config.json"),
+        ("Hiddify", ROAMING / "app.hiddify.com/current-config.json"),
+        ("sing-box", HOME / ".config/sing-box/config.json"),
+        ("sing-box", ROAMING / "sing-box/config.json"),
+    ]
+    for label, root in party_roots:
+        for filename in ("mihomo.yaml", "work/config.yaml", "config.yaml"):
+            files.append((label, root / filename))
+    return files
+
+
+def parse_yaml_controller_file(path: Path, name: str, is_mac: bool = False) -> tuple[list[Controller], list[Controller]]:
+    pipes: list[Controller] = []
+    http: list[Controller] = []
+    try:
+        with path.open(encoding="utf-8-sig") as config:
+            values: dict[str, str] = {}
+            for line in config.read(4 * 1024 * 1024).splitlines():
+                match = re.fullmatch(
+                    r'''(")?(external-controller-pipe|external-controller-unix|external-controller|secret)(?(1)"):[ \t]*(.*?)\s*''',
+                    line,
+                )
+                if match:
+                    scalar = re.fullmatch(r'''("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^ \t#]*)(?:[ \t]+#.*)?''', match[3])
+                    if scalar:
+                        value = scalar[1]
+                        if value.startswith('"'):
+                            try:
+                                value = json.loads(value)
+                            except ValueError:
+                                continue
+                        elif value.startswith("'"):
+                            value = value[1:-1].replace("''", "'")
+                        values[match[2]] = value
+    except (OSError, UnicodeError):
+        return pipes, http
+    pipe = values.get("external-controller-pipe", "").removeprefix(PIPE_PREFIX)
+    if not is_mac and PIPE_NAME.fullmatch(pipe):
+        pipes.append(Controller(pipe=pipe, name=name))
+    unix = values.get("external-controller-unix", "")
+    if is_mac and unix.startswith("/") and "\x00" not in unix:
+        pipes.append(Controller(unix=unix, name=name))
+    port = parse_local_controller_port(values.get("external-controller", ""))
+    if port:
+        http.append(Controller(port=port, secret=values.get("secret", ""), name=name))
+    return pipes, http
+
+
+def parse_json_controller_file(path: Path, name: str) -> list[Controller]:
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+        if len(raw) > 4 * 1024 * 1024:
+            return []
+        data = json.loads(raw)
+    except (OSError, UnicodeError, ValueError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    clash_api = (data.get("experimental") or {}).get("clash_api") if isinstance(data.get("experimental"), dict) else None
+    if not isinstance(clash_api, dict):
+        return []
+    addr = clash_api.get("external_controller")
+    if not isinstance(addr, str):
+        return []
+    port = parse_local_controller_port(addr)
+    if not port:
+        return []
+    secret = clash_api.get("secret")
+    return [Controller(port=port, secret=secret if isinstance(secret, str) else "", name=name)]
+
+
+def is_restricted_region(code: str) -> bool:
+    return code.upper() in RESTRICTED_AI_REGIONS
+
+
+def region_label(code: str) -> str:
+    upper = code.upper().strip()
+    if not upper:
+        return ""
+    return REGION_NAMES.get(upper, upper)
+
+
+def node_looks_restricted(name: str) -> bool:
+    folded = name.casefold()
+    if any(token in folded for token in RESTRICTED_NODE_TOKENS):
+        return True
+    return bool(re.search(r"(?:^|[^a-z])(hk|cn|mo|ru)(?:$|[^a-z])", folded))
+
+
+NODE_REGION_PATTERNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("US", ("美国", "🇺🇸", "united states", "america", "los angeles", "san jose", "seattle", "new york", "dallas", "chicago", "silicon")),
+    ("JP", ("日本", "🇯🇵", "japan", "tokyo", "osaka", "东京", "大阪")),
+    ("TW", ("台湾", "🇹🇼", "taiwan", "taipei", "台北")),
+    ("SG", ("新加坡", "狮城", "🇸🇬", "singapore")),
+    ("HK", ("香港", "🇭🇰", "hong kong", "hongkong")),
+    ("GB", ("英国", "🇬🇧", "united kingdom", "london", "伦敦")),
+    ("DE", ("德国", "🇩🇪", "germany", "frankfurt", "法兰克福")),
+    ("KR", ("韩国", "🇰🇷", "korea", "seoul", "首尔")),
+    ("CA", ("加拿大", "🇨🇦", "canada", "toronto", "vancouver")),
+    ("NL", ("荷兰", "🇳🇱", "netherlands", "amsterdam")),
+    ("FR", ("法国", "🇫🇷", "france", "paris")),
+    ("AU", ("澳大利亚", "澳洲", "🇦🇺", "australia", "sydney")),
+    ("RU", ("俄罗斯", "🇷🇺", "russia", "moscow")),
+    ("CN", ("中国", "🇨🇳", "china")),
+)
+
+
+def infer_region_from_node(node_name: str) -> str:
+    """Infer an ISO country code from a proxy node display name without network calls."""
+    if not node_name:
+        return ""
+    folded = node_name.casefold()
+    for code, tokens in NODE_REGION_PATTERNS:
+        if any(tok in folded for tok in tokens):
+            return code
+    match = re.search(r"(?:^|[^a-z])(us|jp|tw|sg|hk|gb|uk|de|kr|ca|nl|fr|au|ru|cn|mo)(?:$|[^a-z])", folded)
+    if match:
+        code = match[1].upper()
+        return "GB" if code == "UK" else code
+    return ""
+
+
+def probe_exit_region(port: int, timeout: float = 3.5, host: str = "www.cloudflare.com") -> tuple[str, int | None]:
+    """Read proxy exit country code and RTT (ms) via Cloudflare trace through local HTTP CONNECT."""
+    started = time.perf_counter()
+    sock = None
+    try:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        sock.settimeout(timeout)
+        sock.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode("ascii"))
+        with sock.makefile("rb") as reader:
+            status = reader.readline(4096).split()
+            for _ in range(32):
+                line = reader.readline(4096)
+                if line == b"\r\n" or not line:
+                    break
+        if len(status) < 2 or status[1] != b"200":
+            return "", None
+        context = ssl.create_default_context()
+        with context.wrap_socket(sock, server_hostname=host) as tls:
+            tls.sendall(
+                f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: AIProxyLauncher\r\n\r\n".encode("ascii")
+            )
+            chunks = []
+            total = 0
+            while total < 8192:
+                data = tls.recv(4096)
+                if not data:
+                    break
+                chunks.append(data)
+                total += len(data)
+        elapsed_ms = max(1, int(round((time.perf_counter() - started) * 1000)))
+        text = b"".join(chunks).decode("ascii", errors="replace")
+        match = re.search(r"^loc=([A-Z]{2})\s*$", text, re.M)
+        return (match[1], elapsed_ms) if match else ("", elapsed_ms)
+    except OSError:
+        return "", None
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def find_registered_app(display_tokens: tuple[str, ...], executables: tuple[str, ...]) -> Path | None:
+    """Locate an installed Windows desktop app executable via Uninstall Registry."""
+    if sys.platform != "win32":
+        return None
+    tokens = tuple(t.casefold() for t in display_tokens)
+    uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    for hive, view in (
+        (winreg.HKEY_CURRENT_USER, 0),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+    ):
+        try:
+            with winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view) as base:
+                for idx in range(winreg.QueryInfoKey(base)[0]):
+                    try:
+                        with winreg.OpenKey(base, winreg.EnumKey(base, idx)) as entry:
+                            display = str(winreg.QueryValueEx(entry, "DisplayName")[0]).strip().casefold()
+                            if not any(display == tok or display.startswith(tok + " ") for tok in tokens):
+                                continue
+                            for reg_key in ("InstallLocation", "DisplayIcon"):
+                                try:
+                                    raw = os.path.expandvars(str(winreg.QueryValueEx(entry, reg_key)[0])).strip('" ')
+                                    if reg_key == "DisplayIcon":
+                                        raw = raw.split(",", 1)[0].strip('" ')
+                                    if not raw:
+                                        continue
+                                    p = Path(raw)
+                                    if not p.is_absolute() or str(p).startswith("\\\\"):
+                                        continue
+                                    if p.is_file() and p.suffix.lower() == ".exe":
+                                        if not executables or p.name.casefold() in {e.casefold() for e in executables}:
+                                            return p
+                                    elif p.is_dir():
+                                        hit = first_file(*(p / exe for exe in executables))
+                                        if hit:
+                                            return hit
+                                except (OSError, TypeError):
+                                    continue
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return None
+
+
+def pipe_display_name(pipe: str, processes: dict[int, tuple[str, int]], default: str = "") -> str:
+    folded = pipe.casefold()
+    if folded.startswith("mihomoparty\\"):
+        running = {name.casefold() for name, _ in processes.values()}
+        if "jimmm.exe" in running:
+            return "JImmm"
+        if "clash party.exe" in running or "mihomo party.exe" in running or "clash-party.exe" in running:
+            return "Clash Party"
+        if "sparkle.exe" in running:
+            return "Sparkle"
+        return "JImmm" if (ROAMING / "Jimmm").is_dir() else "Clash Party"
+    for token, label in PROXY_PIPE_PATTERNS:
+        if token in folded:
+            return label
+    return default or "Clash"
+
+
+def windows_existing_pipes() -> set[str] | None:
+    if sys.platform != "win32":
+        return None
+    try:
+        return {entry.casefold() for entry in os.listdir(PIPE_PREFIX)}
+    except OSError:
+        return None
+
+
+def windows_active_proxy_pipes(processes: dict[int, tuple[str, int]]) -> list[Controller]:
+    if sys.platform != "win32":
+        return []
+    try:
+        entries = os.listdir(PIPE_PREFIX)
+    except OSError:
+        return []
+    found: list[Controller] = []
+    for entry in entries:
+        folded = entry.casefold()
+        if "service" in folded or not PIPE_NAME.fullmatch(entry):
+            continue
+        if any(token in folded for token, _ in PROXY_PIPE_PATTERNS):
+            found.append(Controller(pipe=entry, name=pipe_display_name(entry, processes)))
+    return found
+
+
+def probe_local_controller(port: int, name: str, timeout: float = 0.7) -> tuple[Controller | None, bool]:
+    """Probe whether 127.0.0.1:port exposes a Clash/Mihomo-compatible REST controller API."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request("GET", "/configs", headers={"Host": "localhost"})
+        with connection.getresponse() as response:
+            if response.status == 401:
+                body = response.read(512)
+                if b"unauthorized" in body.lower() or b"message" in body.lower():
+                    return None, True
+                return None, False
+            if response.status != 200:
+                return None, False
+            body = response.read(65536)
+            data = json.loads(body)
+            if isinstance(data, dict) and (CLASH_CONFIG_KEYS & data.keys()):
+                return Controller(port=port, name=name), False
+    except (OSError, http.client.HTTPException, ValueError):
+        pass
+    finally:
+        connection.close()
+    return None, False
+
+
+def probe_socks5_port(port: int, timeout: float = 0.5) -> bool:
+    """Return True if 127.0.0.1:port responds to a SOCKS5 greeting."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"\x05\x01\x00")
+            reply = sock.recv(2)
+            return len(reply) == 2 and reply[0] == 5 and reply[1] in {0, 2, 0xFF}
+    except OSError:
+        return False
+
+
+def registered_proxy_apps() -> dict[str, Path | None]:
+    if sys.platform != "win32":
+        return {}
+    found: dict[str, Path | None] = {}
+    uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    for hive, view in (
+        (winreg.HKEY_CURRENT_USER, 0),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+    ):
+        try:
+            with winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view) as base:
+                for idx in range(winreg.QueryInfoKey(base)[0]):
+                    try:
+                        with winreg.OpenKey(base, winreg.EnumKey(base, idx)) as entry:
+                            display = str(winreg.QueryValueEx(entry, "DisplayName")[0]).strip()
+                            folded = display.casefold()
+                            profile = _REGISTRY_MAP.get(folded)
+                            if not profile:
+                                profile = next(
+                                    (p for token, p in _REGISTRY_MAP.items() if folded.startswith(token + " ")),
+                                    None,
+                                )
+                            if not profile or found.get(profile.name):
+                                continue
+                            resolved: Path | None = None
+                            try:
+                                raw_loc = os.path.expandvars(str(winreg.QueryValueEx(entry, "InstallLocation")[0])).strip('" ')
+                                if raw_loc:
+                                    loc = Path(raw_loc)
+                                    if loc.is_absolute() and not str(loc).startswith("\\\\"):
+                                        resolved = loc
+                            except (OSError, TypeError):
+                                pass
+                            if resolved is None:
+                                try:
+                                    raw_icon = os.path.expandvars(str(winreg.QueryValueEx(entry, "DisplayIcon")[0])).strip('" ')
+                                    icon_path = Path(raw_icon.split(",", 1)[0].strip('" '))
+                                    if icon_path.is_absolute() and not str(icon_path).startswith("\\\\") and icon_path.suffix.lower() == ".exe":
+                                        resolved = icon_path
+                                except (OSError, TypeError):
+                                    pass
+                            found[profile.name] = resolved
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return found
+
+
+def first_file(*paths: Path) -> Path | None:
+    for path in paths:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _hide_standalone_core(label: str, found: dict[str, Path | None]) -> bool:
+    if label not in STANDALONE_CORES:
+        return False
+    profile = PROFILE_BY_NAME.get(label)
+    if not profile:
+        return False
+    return any(
+        (other := PROFILE_BY_NAME.get(name)) is not None
+        and not other.standalone_core
+        and other.family == profile.family
+        for name in found
+    )
+
+
+def detected_proxy_apps(processes: dict[int, tuple[str, int]] | None = None, is_mac: bool = False) -> dict[str, Path | None]:
+    if is_mac:
+        result: dict[str, Path | None] = dict(macos.proxy_apps())
+        for name, path in macos.config_files():
+            try:
+                if path.is_file():
+                    result.setdefault(name, None)
+            except OSError:
+                pass
+        if processes:
+            for pid in processes:
+                label = identify_process_proxy(pid, processes)
+                if label and not _hide_standalone_core(label, result):
+                    result.setdefault(label, None)
+        return result
+
+    program_roots = [Path(p) for key in ("ProgramFiles", "ProgramFiles(x86)") if (p := os.environ.get(key))]
+    scoop_apps = HOME / "scoop/apps"
+    roots = (*program_roots, LOCAL / "Programs", LOCAL)
+    found: dict[str, Path | None] = {}
+
+    # 1. Standard install directories, Scoop, & PATH (no hardcoded personal folders)
+    for profile in PROFILES:
+        candidates: list[Path] = []
+        for folder in profile.win_dirs:
+            for exe in profile.win_exes:
+                for root in roots:
+                    candidates.append(root / folder / exe)
+                candidates.append(scoop_apps / folder.lower().replace(" ", "-") / "current" / exe)
+        if profile.standalone_core:
+            for exe in profile.win_exes:
+                if resolved := shutil.which(exe):
+                    candidates.append(Path(resolved))
+        binary = first_file(*candidates)
+        if binary:
+            found[profile.name] = binary
+
+    # 2. Windows Uninstall Registry
+    for name, location in registered_proxy_apps().items():
+        if found.get(name):
+            continue
+        binary = None
+        if location:
+            if location.is_file() and location.suffix.lower() == ".exe":
+                binary = location
+            elif location.is_dir():
+                profile = PROFILE_BY_NAME.get(name)
+                if profile:
+                    binary = first_file(*(location / exe for exe in profile.win_exes))
+        found.setdefault(name, binary)
+
+    # 3. Config files on disk
+    for name, config in config_files(is_mac=False):
+        try:
+            if config.is_file():
+                found.setdefault(name, None)
+        except OSError:
+            pass
+
+    # 4. Live running proxy processes (also resolves portable app binary path!)
+    if processes is not None:
+        for pid, (exe_name, _parent) in processes.items():
+            label = identify_process_proxy(pid, processes)
+            if not label or _hide_standalone_core(label, found):
+                continue
+            if not found.get(label):
+                profile = PROFILE_BY_NAME.get(label)
+                exe_path = None
+                if profile and exe_name.casefold() in {e.casefold() for e in profile.win_exes}:
+                    exe_path = process_executable_path(pid)
+                found[label] = exe_path or found.get(label)
+    return found
+
+
+def discover_proxies(
+    processes: dict[int, tuple[str, int]],
+    listeners: list[tuple[int, str, int]],
+    sys_port: int | None,
+    env_ports: list[int],
+    static_controllers: list[Controller],
+    custom: Controller | None = None,
+    *,
+    is_mac: bool = False,
+    detected_apps: dict[str, Path | None] | None = None,
+    probe_controller=probe_local_controller,
+    exclude_ports: set[int] | None = None,
+) -> DiscoverySnapshot:
+    """Universally discover running Clash/Mihomo controllers and generic HTTP proxy ports."""
+    apps = dict(detected_apps) if detected_apps is not None else detected_proxy_apps(processes, is_mac=is_mac)
+    hints: list[str] = []
+    excluded = set(exclude_ports or ())
+    self_pid = os.getpid()
+
+    # Map listening ports -> owning PIDs and process labels (ignoring our own relay ports)
+    port_pids: dict[int, list[int]] = {}
+    pid_ports: dict[int, list[int]] = {}
+    filtered_listeners: list[tuple[int, str, int]] = []
+    for pid, ip, port in listeners:
+        if pid == self_pid or port in excluded:
+            continue
+        filtered_listeners.append((pid, ip, port))
+        port_pids.setdefault(port, []).append(pid)
+        pid_ports.setdefault(pid, []).append(port)
+    listeners = filtered_listeners
+    if sys_port in excluded:
+        sys_port = None
+    env_ports = [p for p in env_ports if p not in excluded]
+
+    # Determine PIDs that belong to known proxy processes OR own system/env proxy ports
+    proxy_pids: dict[int, str] = {}
+    for pid in {p for p, _, _ in listeners}:
+        label = identify_process_proxy(pid, processes)
+        if label:
+            proxy_pids[pid] = label
+
+    sys_pids: set[int] = set()
+    for special_port, fallback_name in [
+        *([(sys_port, "系统代理")] if sys_port else []),
+        *((port, "环境变量代理") for port in env_ports),
+    ]:
+        for pid in port_pids.get(special_port, ()):
+            sys_pids.add(pid)
+            parent = processes.get(pid, ("", 0))[1]
+            if parent in pid_ports:
+                sys_pids.add(parent)
+            # Also include children of the parent (e.g. GUI spawned core + controller)
+            for child_pid, (_, child_parent) in processes.items():
+                if child_parent in {pid, parent} and child_pid in pid_ports:
+                    sys_pids.add(child_pid)
+            proxy_pids.setdefault(pid, fallback_process_label(pid, processes, fallback_name))
+
+    for pid in sys_pids:
+        if pid not in proxy_pids:
+            proxy_pids[pid] = fallback_process_label(pid, processes, "系统代理")
+
+    # 1. Start with custom controller, active OS pipes/sockets, and static config controllers
+    controllers: list[Controller] = []
+    if custom:
+        controllers.append(custom)
+    existing_pipes: set[str] | None = None
+    if not is_mac:
+        existing_pipes = windows_existing_pipes()
+        controllers.extend(windows_active_proxy_pipes(processes))
+    for ctrl in static_controllers:
+        # Skip non-existent named pipes / unix sockets in auto-discovery to avoid timeouts.
+        if not is_mac and ctrl.pipe and existing_pipes is not None and ctrl.pipe.casefold() not in existing_pipes:
+            continue
+        if is_mac and ctrl.unix and not Path(ctrl.unix).is_socket():
+            continue
+        controllers.append(ctrl)
+
+    known_controller_ports = {c.port for c in controllers if c.port}
+
+    # 2. Probe listening ports owned by proxy processes to discover live Clash/Mihomo/Sing-box APIs
+    probe_candidates: list[tuple[int, str, int]] = []
+    seen_probe_ports: set[int] = set()
+    for pid, _ip, port in listeners:
+        if pid not in proxy_pids or port in known_controller_ports or port in seen_probe_ports:
+            continue
+        seen_probe_ports.add(port)
+        probe_candidates.append((port, proxy_pids[pid], pid))
+
+    protected_controller_ports: dict[int, str] = {}
+    discovered_controller_ports: set[int] = set(known_controller_ports)
+    controller_sibling_ports: dict[Controller, list[int]] = {}
+
+    if probe_candidates:
+        def _probe(item: tuple[int, str, int]):
+            port, label, pid = item
+            ctrl, needs_secret = probe_controller(port, label)
+            return port, label, pid, ctrl, needs_secret
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(probe_candidates))) as pool:
+            for port, label, pid, ctrl, needs_secret in pool.map(_probe, probe_candidates):
+                if ctrl:
+                    controllers.append(ctrl)
+                    discovered_controller_ports.add(port)
+                    siblings = _sibling_ports(pid, port, processes, pid_ports, sys_port)
+                    if siblings:
+                        controller_sibling_ports[ctrl] = siblings
+                elif needs_secret:
+                    protected_controller_ports[port] = label
+                    discovered_controller_ports.add(port)
+
+    # Also attach sibling ports for static HTTP controllers (useful for Sing-box controllers with port=0)
+    for ctrl in controllers:
+        if ctrl.port and ctrl not in controller_sibling_ports:
+            for pid in port_pids.get(ctrl.port, ()):
+                siblings = _sibling_ports(pid, ctrl.port, processes, pid_ports, sys_port)
+                if siblings:
+                    controller_sibling_ports[ctrl] = siblings
+                    break
+
+    for port, label in sorted(protected_controller_ports.items()):
+        hints.append(
+            f"检测到 {label} 的控制接口 127.0.0.1:{port} 需要密钥；"
+            "如需核对分流规则或自动切换节点/TUN，可在「控制接口」填写该端口和密钥。"
+        )
+
+    # 3. Collect generic HTTP/mixed proxy port candidates (excluding controller API ports)
+    http_proxies: list[HTTPProxyCandidate] = []
+    seen_http_ports: set[int] = set()
+
+    def add_http(port: int, name: str, source: str, pid: int | None = None):
+        if port in seen_http_ports or port in discovered_controller_ports:
+            return
+        seen_http_ports.add(port)
+        http_proxies.append(HTTPProxyCandidate(port=port, name=name, source=source, pid=pid))
+        if name not in {"系统代理", "环境变量代理"}:
+            apps.setdefault(name, None)
+
+    if sys_port:
+        owning_pid = port_pids.get(sys_port, [None])[0]
+        label = fallback_process_label(owning_pid, processes, "系统代理") if owning_pid else "系统代理"
+        add_http(sys_port, label, "system", owning_pid)
+
+    for port in env_ports:
+        owning_pid = port_pids.get(port, [None])[0]
+        label = fallback_process_label(owning_pid, processes, "环境变量代理") if owning_pid else "环境变量代理"
+        add_http(port, label, "env", owning_pid)
+
+    # Sort process listening ports so known default ports come before arbitrary internal ports
+    proc_candidates: list[tuple[int, int, str, int]] = []
+    for pid, _ip, port in listeners:
+        if pid not in proxy_pids or port in seen_http_ports or port in discovered_controller_ports:
+            continue
+        label = proxy_pids[pid]
+        profile = PROFILE_BY_NAME.get(label)
+        is_default = 0 if (profile and port in profile.default_ports) else 1
+        proc_candidates.append((is_default, port, label, pid))
+
+    proc_candidates.sort()
+    for _, port, label, pid in proc_candidates:
+        add_http(port, label, "process", pid)
+
+    # Deduplicate controllers while preserving order
+    deduped_controllers: list[Controller] = []
+    seen_ctrls: set[tuple[str, int | None, str]] = set()
+    for ctrl in controllers:
+        key = (ctrl.pipe.casefold(), ctrl.port, ctrl.unix)
+        if key not in seen_ctrls:
+            seen_ctrls.add(key)
+            deduped_controllers.append(ctrl)
+
+    return DiscoverySnapshot(
+        controllers=deduped_controllers,
+        http_proxies=http_proxies,
+        detected_apps=apps,
+        hints=hints,
+        controller_sibling_ports=controller_sibling_ports,
+    )
+
+
+def _sibling_ports(
+    pid: int,
+    exclude_port: int,
+    processes: dict[int, tuple[str, int]],
+    pid_ports: dict[int, list[int]],
+    sys_port: int | None,
+) -> list[int]:
+    family = {pid}
+    parent = processes.get(pid, ("", 0))[1]
+    if parent:
+        family.add(parent)
+    for child, (_, child_parent) in processes.items():
+        if child_parent in family:
+            family.add(child)
+    ports = [p for member in family for p in pid_ports.get(member, ()) if p != exclude_port]
+    ports = list(dict.fromkeys(ports))
+    if sys_port and sys_port in ports:
+        ports.remove(sys_port)
+        ports.insert(0, sys_port)
+    return ports

@@ -1,0 +1,110 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v2.0.0)"
+        required: true
+        default: "v2.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare-release:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Determine release tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure GitHub Release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" \
+              --title "AI 代理启动器 $TAG" \
+              --generate-notes
+          fi
+
+  build-windows:
+    needs: prepare-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip "pyinstaller>=6.10"
+
+      - name: Run tests, build Windows exe, and package macOS source
+        shell: pwsh
+        run: .\build-windows.ps1
+
+      - name: Upload Windows executable & macOS source archive to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          gh release upload "$TAG" \
+            "新版/AIProxyLauncher.exe" \
+            "新版/AIProxyLauncher-macOS-Source.zip" \
+            --clobber
+
+  build-macos:
+    needs: prepare-release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Ensure Python 3.11+ with Tkinter is available
+        id: py
+        run: |
+          if python3 -c "import sys, tkinter; assert sys.version_info >= (3, 11)" 2>/dev/null; then
+            echo "python=$(command -v python3)" >> "$GITHUB_OUTPUT"
+          else
+            brew install python@3.12 python-tk@3.12
+            PY_BIN="$(brew --prefix python@3.12)/bin/python3.12"
+            "$PY_BIN" -c "import sys, tkinter; assert sys.version_info >= (3, 11)"
+            echo "python=$PY_BIN" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run tests and build macOS .app bundle
+        env:
+          PYTHON: ${{ steps.py.outputs.python }}
+          RUN_GUI_SMOKE: "0"
+        run: bash build-macos.sh
+
+      - name: Upload macOS .app bundle ZIP to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-release.outputs.tag }}
+        run: |
+          ARCH="$(uname -m)"
+          ZIP_PATH="构建输出/macOS-${ARCH}/AIProxyLauncher-macOS-${ARCH}.zip"
+          test -f "$ZIP_PATH"
+          gh release upload "$TAG" "$ZIP_PATH" --clobber
+
