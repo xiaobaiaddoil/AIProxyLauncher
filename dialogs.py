@@ -647,3 +647,268 @@ def confirm_restart_app(win, key: str, target: Target, path: Path | None, port: 
     dialog.bind("<Escape>", lambda _e: dialog.destroy())
     dialog.grab_set()
     dialog.focus_set()
+
+
+USER_GUIDE_SECTIONS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+    (
+        "01",
+        "快速开始（3 步一键启动）",
+        (
+            "先打开本机任意代理软件并连上节点：默认「自动检测」已适配 Clash Verge Rev、Clash Party、JImmm、FlClash、v2rayN、Hiddify、NekoBox等20+款客户端；其他代理也可切换「手动指定端口」。",
+            "在主界面点击卡片勾选需要使用的AI应用（支持桌面客户端、独立网页窗口与终端CLI）。",
+            "点击右上角「▶ 检查修复并打开」，软件会自动核验12+项AI服务连通性、TUN状态与出口节点后再安全启动。",
+        ),
+    ),
+    (
+        "02",
+        "统一本地中继（换代理免重启 · 网页免重登）",
+        (
+            "点击顶部「⇄ 统一中继」可在127.0.0.1:17890启动本地稳定中继层（绝不直连泄漏）。",
+            "开启后独立网页窗口共用固定浏览器资料目录，切换代理软件不再掉登录；后台按域名自动热切换上游代理并支持快速故障转移。",
+        ),
+    ),
+    (
+        "03",
+        "出口地区识别与快捷切节点",
+        (
+            "顶部代理胶囊实时展示AI出口国家/地区与延迟；鼠标悬停底部服务圆点，可查看每项服务实际命中的出站节点与响应耗时。",
+            "遇到香港等可能受部分AI平台限制的出口地区会高亮提醒，点击「切换节点」即可直接并发测速并换至美/日/台/新等节点。",
+        ),
+    ),
+    (
+        "04",
+        "环境体检与运行中应用管理",
+        (
+            "点击「环境体检」可一键排查并带.bak备份修复环境变量、Codex、Git、npm中残留的失效旧代理端口，同时检测DNS污染与IPv6泄漏，并支持复制脱敏诊断报告。",
+            "已在运行的桌面应用会显示「● 运行中」与「唤起 ↗」，可直接置顶已走对代理的窗口，或引导安全重启以应用新端口。",
+        ),
+    ),
+    (
+        "05",
+        "常驻托盘、扩展应用与随时复阅",
+        (
+            "点击「+ 管理应用」可开启Cursor、Windsurf、VS Code、Grok、Perplexity等预设、添加自定义应用/网页，并设置开机静默启动到托盘。",
+            "点击下方「我已阅读」进入主界面后，本说明书会收起在窗口右上角「? 使用说明」，随时点击即可再次查阅。",
+        ),
+    ),
+)
+
+
+def open_user_guide(win, *, startup_gate: bool = False, on_acknowledged=None) -> tk.Toplevel:
+    """Display the interactive user manual modal.
+
+    When startup_gate=True, blocks the main window and defers further actions until the user
+    explicitly clicks '我已阅读，进入启动器'. When reopened from the top-right button
+    (startup_gate=False), allows reviewing and toggling whether to auto-show on next launch.
+    """
+    existing = getattr(win, "_guide_dialog", None)
+    if existing is not None:
+        try:
+            if existing.winfo_exists():
+                existing.lift()
+                existing.focus_force()
+                return existing
+        except tk.TclError:
+            pass
+
+    p = win.p
+    dialog = tk.Toplevel(win.root, bg=p["surface"])
+    win._guide_dialog = dialog
+    dialog.title("AI 代理启动器 · 使用说明书")
+    dialog.transient(win.root)
+    sw, sh = dialog.winfo_screenwidth(), dialog.winfo_screenheight()
+    width = min(win.px(680), sw - 48)
+    height = min(win.px(610), sh - 80)
+    dialog.minsize(min(win.px(560), sw - 64), min(win.px(460), sh - 96))
+
+    win.root.update_idletasks()
+    rx, ry = win.root.winfo_rootx(), win.root.winfo_rooty()
+    rw, rh = win.root.winfo_width(), win.root.winfo_height()
+    if rw > 100 and rh > 100:
+        pos_x = max(24, min(sw - width - 24, rx + (rw - width) // 2))
+        pos_y = max(24, min(sh - height - 48, ry + (rh - height) // 2))
+    else:
+        pos_x = max(24, (sw - width) // 2)
+        pos_y = max(24, (sh - height) // 2)
+    dialog.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+
+    # ── Dark Hero Banner ────────────────────────────────────────────────
+    banner = tk.Frame(dialog, bg=p["hero_bg"], padx=win.px(20), pady=win.px(15))
+    banner.pack(fill="x")
+
+    title_bar = tk.Frame(banner, bg=p["hero_bg"])
+    title_bar.pack(fill="x")
+    badge = tk.Label(
+        title_bar, text="GUIDE", font=(FONT, 8, "bold"),
+        bg=TEAL, fg="#FFFFFF", padx=8, pady=2,
+    )
+    badge.pack(side="left", padx=(0, win.px(10)))
+    tk.Label(
+        title_bar, text="AI 代理启动器 · 使用说明书",
+        font=(FONT, 14, "bold"), bg=p["hero_bg"], fg=p["hero_text"],
+    ).pack(side="left")
+
+    subtitle_text = (
+        "请先浏览以下核心使用说明，点击底部「我已阅读」后即可进入主界面并开始检测"
+        if startup_gate else
+        "随时可在主界面右上角「? 使用说明」重新打开查阅"
+    )
+    tk.Label(
+        banner, text=subtitle_text, font=(FONT, 9),
+        bg=p["hero_bg"], fg=p["hero_muted"], anchor="w",
+    ).pack(fill="x", pady=(win.px(6), 0))
+
+    # ── Scrollable Structured Guide Cards ───────────────────────────────
+    body_wrap = tk.Frame(dialog, bg=p["canvas"])
+    body_wrap.pack(fill="both", expand=True)
+
+    canvas = tk.Canvas(body_wrap, bg=p["canvas"], highlightthickness=0, bd=0, yscrollincrement=24)
+    scrollbar = ttk.Scrollbar(body_wrap, orient="vertical", command=canvas.yview, style="Subtle.Vertical.TScrollbar")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    content = tk.Frame(canvas, bg=p["canvas"], padx=win.px(16), pady=win.px(12))
+    content_win = canvas.create_window(0, 0, anchor="nw", window=content)
+
+    wrap_labels: list[tk.Label] = []
+    for num, heading, bullets in USER_GUIDE_SECTIONS:
+        card = tk.Frame(
+            content, bg=p["surface"],
+            highlightthickness=1, highlightbackground=p["border"],
+            padx=win.px(14), pady=win.px(10),
+        )
+        card.pack(fill="x", pady=(0, win.px(9)))
+
+        head_row = tk.Frame(card, bg=p["surface"])
+        head_row.pack(fill="x", pady=(0, win.px(5)))
+        tk.Label(
+            head_row, text=num, font=(FONT, 8, "bold"),
+            bg=p["teal_soft"], fg=p["teal_ink"], padx=7, pady=1,
+        ).pack(side="left", padx=(0, win.px(8)))
+        tk.Label(
+            head_row, text=heading, font=(FONT, 10, "bold"),
+            bg=p["surface"], fg=p["ink"],
+        ).pack(side="left")
+
+        for item in bullets:
+            row = tk.Frame(card, bg=p["surface"])
+            row.pack(fill="x", pady=win.px(2))
+            tk.Label(row, text="•", font=(FONT, 9, "bold"), bg=p["surface"], fg=TEAL).pack(side="left", anchor="n", padx=(2, 6))
+            lbl = tk.Label(
+                row, text=item, font=(FONT, 9), bg=p["surface"], fg=p["muted"],
+                justify="left", anchor="w", wraplength=win.px(560),
+            )
+            lbl.pack(side="left", fill="x", expand=True)
+            wrap_labels.append(lbl)
+
+    def sync_scroll(_event=None) -> None:
+        bbox = canvas.bbox("all")
+        if bbox:
+            canvas.configure(scrollregion=bbox)
+
+    def on_canvas_resize(event) -> None:
+        canvas.itemconfigure(content_win, width=event.width)
+        target_wrap = max(win.px(320), event.width - win.px(86))
+        for lbl in wrap_labels:
+            lbl.configure(wraplength=target_wrap)
+        sync_scroll()
+
+    def on_wheel(event) -> None:
+        if canvas.yview() != (0.0, 1.0):
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    content.bind("<Configure>", sync_scroll)
+    canvas.bind("<Configure>", on_canvas_resize)
+    dialog.bind("<MouseWheel>", on_wheel)
+
+    # ── Bottom Action Bar ───────────────────────────────────────────────
+    divider = tk.Frame(dialog, bg=p["border"], height=1)
+    divider.pack(fill="x")
+    footer = tk.Frame(dialog, bg=p["surface"], padx=win.px(18), pady=win.px(12))
+    footer.pack(fill="x")
+
+    if startup_gate:
+        skip_var = tk.BooleanVar(value=bool(win.skip_guide_on_start))
+        tk.Checkbutton(
+            footer, text="下次打开不再自动弹出（右上角随时可重看）",
+            variable=skip_var, bg=p["surface"], activebackground=p["surface"],
+            fg=p["muted"], selectcolor=p["surface_alt"], font=(FONT, 8),
+        ).pack(side="left")
+
+        def acknowledge(_event=None) -> None:
+            win.skip_guide_on_start = bool(skip_var.get())
+            win.save()
+            win._guide_dialog = None
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+            if on_acknowledged:
+                on_acknowledged()
+
+        def decline_exit() -> None:
+            win._guide_dialog = None
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+            win.force_exit()
+
+        dialog.confirm_button = PillButton(
+            footer, "✓ 我已阅读，进入启动器", acknowledge,
+            bg=p["surface"], fill=TEAL, hover_fill=TEAL_DARK, fg="#FFFFFF",
+            outline="", hover_outline="", font_spec=(FONT, 9, "bold"),
+            height=win.px(33), pad_x=win.px(16),
+        )
+        dialog.confirm_button.pack(side="right")
+        dialog.exit_button = PillButton(
+            footer, "退出", decline_exit,
+            bg=p["surface"], fill=p["surface_alt"], hover_fill=p["surface_hover"],
+            fg=p["muted"], outline=p["border"], hover_outline=p["border_hover"],
+            height=win.px(33), pad_x=win.px(12),
+        )
+        dialog.exit_button.pack(side="right", padx=(0, win.px(8)))
+
+        dialog.protocol("WM_DELETE_WINDOW", decline_exit)
+        dialog.bind("<Return>", acknowledge)
+    else:
+        auto_show_var = tk.BooleanVar(value=not win.skip_guide_on_start)
+
+        def on_toggle_auto() -> None:
+            win.skip_guide_on_start = not auto_show_var.get()
+            win.save()
+
+        tk.Checkbutton(
+            footer, text="每次打开程序时自动弹出使用说明书",
+            variable=auto_show_var, command=on_toggle_auto,
+            bg=p["surface"], activebackground=p["surface"],
+            fg=p["muted"], selectcolor=p["surface_alt"], font=(FONT, 8),
+        ).pack(side="left")
+
+        def close_review(_event=None) -> None:
+            win._guide_dialog = None
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            dialog.destroy()
+
+        dialog.confirm_button = PillButton(
+            footer, "我知道了", close_review,
+            bg=p["surface"], fill=TEAL, hover_fill=TEAL_DARK, fg="#FFFFFF",
+            outline="", hover_outline="", font_spec=(FONT, 9, "bold"),
+            height=win.px(32), pad_x=win.px(18),
+        )
+        dialog.confirm_button.pack(side="right")
+
+        dialog.protocol("WM_DELETE_WINDOW", close_review)
+        dialog.bind("<Escape>", close_review)
+        dialog.bind("<Return>", close_review)
+
+    dialog.grab_set()
+    dialog.lift()
+    dialog.focus_force()
+    return dialog

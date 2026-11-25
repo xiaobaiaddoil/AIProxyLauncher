@@ -41,6 +41,9 @@ class LauncherWindow:
         self.theme_name = saved.get("theme") if saved.get("theme") in THEMES else "light"
         self.minimize_to_tray = tk.BooleanVar(value=saved.get("minimize_to_tray") is True)
         self.relay_enabled = saved.get("relay_enabled") is True
+        self.skip_guide_on_start = saved.get("skip_guide_on_start") is True
+        self._guide_dialog: tk.Toplevel | None = None
+        self._startup_started = False
         self.relay = relay.LocalProxyRelay(relay.DEFAULT_RELAY_PORT)
 
         self.custom_targets, self.enabled_presets, self.hidden_targets = parse_custom_targets(saved)
@@ -284,7 +287,18 @@ class LauncherWindow:
         self.proxy_button.pack(side="left")
 
         right = tk.Frame(hero_inner, bg=p["hero_bg"])
-        right.pack(side="right", padx=(self.px(12), 0))
+        right.pack(side="right", fill="y", padx=(self.px(12), 0))
+
+        top_right_row = tk.Frame(right, bg=p["hero_bg"])
+        top_right_row.pack(anchor="e", pady=(0, self.px(6)))
+        self.guide_button = PillButton(
+            top_right_row, "? 使用说明", self.open_guide,
+            bg=p["hero_bg"], fill=p["hero_card"], hover_fill="#283548", fg="#CBD5E1",
+            outline=p["hero_border"], hover_outline=TEAL, font_spec=(FONT, 8, "bold"),
+            height=self.px(22), pad_x=self.px(10),
+            tooltip="打开使用说明书（随时可反复查阅与设置启动弹出偏好）",
+        )
+        self.guide_button.pack(side="right")
 
         btn_row = tk.Frame(right, bg=p["hero_bg"])
         btn_row.pack(anchor="e")
@@ -306,7 +320,7 @@ class LauncherWindow:
         self.launch_button.pack(side="left")
 
         auto_row = tk.Frame(right, bg=p["hero_bg"])
-        auto_row.pack(anchor="e", pady=(self.px(10), 0))
+        auto_row.pack(anchor="e", pady=(self.px(7), 0))
         tk.Label(auto_row, text="启动时自动运行勾选项", fg=p["hero_muted"], bg=p["hero_bg"], font=(FONT, 8)).pack(side="left", padx=(0, self.px(8)))
         self.auto_switch = ToggleSwitch(auto_row, self.auto, command=self.save, bg=p["hero_bg"], width=self.px(38), height=self.px(20))
         self.controls.append(self.auto_switch)
@@ -545,10 +559,31 @@ class LauncherWindow:
         if self.tray_icon and self.tray_icon.start():
             self.root.withdraw()
 
+    def open_guide(self, *, startup_gate: bool = False, on_acknowledged=None) -> tk.Toplevel:
+        return dialogs.open_user_guide(self, startup_gate=startup_gate, on_acknowledged=on_acknowledged)
+
+    def start_background_tasks(self) -> None:
+        """Start periodic live-route polling and initial proxy check/auto-launch once ready."""
+        if self._startup_started:
+            return
+        self._startup_started = True
+        self.root.after(100, self.refresh_actual)
+        if self.auto.get() and self.selected_keys():
+            self.root.after(300, lambda: self.begin(self.selected_keys(), True))
+        else:
+            self.root.after(300, lambda: self.begin(list(self.targets), False))
+
     def restore_from_tray(self) -> None:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        if self._guide_dialog is not None:
+            try:
+                if self._guide_dialog.winfo_exists():
+                    self._guide_dialog.lift()
+                    self._guide_dialog.focus_force()
+            except tk.TclError:
+                pass
 
     def _tray_action(self, opening: bool) -> None:
         self.restore_from_tray()
@@ -857,6 +892,7 @@ class LauncherWindow:
                 "theme": self.theme_name,
                 "minimize_to_tray": self.minimize_to_tray.get(),
                 "relay_enabled": self.relay_enabled,
+                "skip_guide_on_start": self.skip_guide_on_start,
                 "enabled_presets": self.enabled_presets,
                 "hidden_targets": sorted(self.hidden_targets),
                 "custom_targets": serialize_custom_targets(self.custom_targets),
@@ -1297,13 +1333,17 @@ def show(smoke: bool = False, report: Path | None = None, minimized: bool = Fals
             root.winfo_geometry(), app.log.winfo_geometry(), root.winfo_screenheight()
         )
         assert all(tag.winfo_ismapped() for tag in app.tags.values()) and len(app.actual) == len(app.targets)
+        assert app.guide_button.winfo_ismapped()
         if report:
             report.write_text(f"UI OK {root.winfo_width()}x{root.winfo_height()} / {len(app.tags)} cards", encoding="utf-8")
         root.destroy()
         return
-    root.after(100, app.refresh_actual)
-    if app.auto.get() and app.selected_keys():
-        root.after(350, lambda: app.begin(app.selected_keys(), True))
+    if not minimized and not app.skip_guide_on_start:
+        def after_guide() -> None:
+            app.write("使用说明书已收起至右上角「? 使用说明」，随时点击即可再次查阅。", "good")
+            app.start_background_tasks()
+
+        root.after(80, lambda: app.open_guide(startup_gate=True, on_acknowledged=after_guide))
     else:
-        root.after(350, lambda: app.begin(list(app.targets), False))
+        app.start_background_tasks()
     root.mainloop()

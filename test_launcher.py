@@ -906,6 +906,49 @@ Active Routes:
         self.assertIn("ide", running)
         self.assertEqual(routes["ide"], ["统一中继 :17890 · 代理连接中"])
 
+    def test_user_guide_startup_gate_and_top_right_reopen(self):
+        import tkinter as tk
+        import dialogs
+        import interface
+
+        self.assertGreaterEqual(len(dialogs.USER_GUIDE_SECTIONS), 5)
+        self.assertTrue(any("右上角" in bullet for _, _, bullets in dialogs.USER_GUIDE_SECTIONS for bullet in bullets))
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(interface, "DATA", Path(temp)):
+            try:
+                root = tk.Tk()
+            except tk.TclError:
+                self.skipTest("Tk display unavailable")
+            root.withdraw()
+            try:
+                win = interface.LauncherWindow(root, enable_tray=False)
+                self.assertFalse(win.skip_guide_on_start)
+                self.assertTrue(hasattr(win, "guide_button"))
+
+                # Startup gate: does not acknowledge until user clicks "我已阅读"
+                acked = []
+                dlg = win.open_guide(startup_gate=True, on_acknowledged=lambda: acked.append(True))
+                # Calling open_guide again reuses the existing modal instead of duplicating
+                self.assertIs(win.open_guide(), dlg)
+                self.assertEqual(acked, [])
+                dlg.confirm_button._command()
+                root.update()
+                self.assertEqual(acked, [True])
+                self.assertFalse(win.skip_guide_on_start)
+                self.assertIsNone(win._guide_dialog)
+
+                # Reopening from top-right button works repeatedly and closes cleanly
+                dlg2 = win.open_guide(startup_gate=False)
+                self.assertTrue(dlg2.winfo_exists())
+                dlg2.confirm_button._command()
+                root.update()
+                self.assertIsNone(win._guide_dialog)
+            finally:
+                try:
+                    root.destroy()
+                except tk.TclError:
+                    pass
+
 
 if __name__ == "__main__":
     unittest.main()
