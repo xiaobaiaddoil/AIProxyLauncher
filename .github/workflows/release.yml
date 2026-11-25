@@ -37,8 +37,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.meta.outputs.tag }}
         run: |
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
               --title "AI 代理启动器 $TAG" \
               --generate-notes
           fi
@@ -68,6 +69,7 @@ jobs:
           gh release upload "$TAG" \
             "新版/AIProxyLauncher.exe" \
             "新版/AIProxyLauncher-macOS-Source.zip" \
+            --repo "$GITHUB_REPOSITORY" \
             --clobber
 
   build-macos:
@@ -106,5 +108,5 @@ jobs:
           ARCH="$(uname -m)"
           ZIP_PATH="构建输出/macOS-${ARCH}/AIProxyLauncher-macOS-${ARCH}.zip"
           test -f "$ZIP_PATH"
-          gh release upload "$TAG" "$ZIP_PATH" --clobber
+          gh release upload "$TAG" "$ZIP_PATH" --repo "$GITHUB_REPOSITORY" --clobber
 
