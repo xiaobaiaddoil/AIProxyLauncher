@@ -1105,6 +1105,280 @@ Active Routes:
         with patch.object(app, "_probe_hosts_and_region", return_value=([good_probe], "CN", 20)):
             self.assertIsNone(app.check_tun_only(["chatgpt.com"]))
 
+    def test_relay_socks5_upstream_connect_and_plain_http_bridging(self):
+        import socket
+        import struct
+        import threading
+        import relay as relay_mod
+
+        # 1. Local echo target server
+        target_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        target_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        target_srv.bind(("127.0.0.1", 0))
+        target_srv.listen(8)
+        target_port = target_srv.getsockname()[1]
+
+        # 2. Local RFC 1928 SOCKS5 mock server redirecting any CONNECT to target_srv
+        socks_srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        socks_srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        socks_srv.bind(("127.0.0.1", 0))
+        socks_srv.listen(8)
+        socks_port = socks_srv.getsockname()[1]
+
+        stop = threading.Event()
+        seen_domains: list[tuple[str, int]] = []
+
+        def run_target():
+            target_srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    c, _ = target_srv.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                with c:
+                    c.settimeout(2.0)
+                    data = c.recv(4096)
+                    if data.startswith(b"GET "):
+                        c.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + str(len(data)).encode() + b"\r\nConnection: close\r\n\r\n" + data)
+                    else:
+                        c.sendall(b"ECHO:" + data)
+
+        def handle_socks(client: socket.socket):
+            with client:
+                client.settimeout(2.0)
+                ver_n = client.recv(2)
+                if len(ver_n) < 2 or ver_n[0] != 5:
+                    return
+                client.recv(ver_n[1])
+                client.sendall(b"\x05\x00")
+                hdr = client.recv(4)
+                if len(hdr) < 4 or hdr[1] != 1 or hdr[3] != 3:
+                    return
+                alen = client.recv(1)[0]
+                dom = client.recv(alen).decode("ascii")
+                dport = struct.unpack("!H", client.recv(2))[0]
+                seen_domains.append((dom, dport))
+                up = socket.create_connection(("127.0.0.1", target_port), timeout=2.0)
+                with up:
+                    client.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00")
+                    client.settimeout(2.0)
+                    up.settimeout(2.0)
+                    req = client.recv(4096)
+                    if req:
+                        up.sendall(req)
+                        resp = up.recv(4096)
+                        if resp:
+                            client.sendall(resp)
+
+        def run_socks():
+            socks_srv.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    c, _ = socks_srv.accept()
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+                threading.Thread(target=handle_socks, args=(c,), daemon=True).start()
+
+        t_target = threading.Thread(target=run_target, daemon=True)
+        t_socks = threading.Thread(target=run_socks, daemon=True)
+        t_target.start()
+        t_socks.start()
+        r = relay_mod.LocalProxyRelay(preferred_port=0)
+        try:
+            rport = r.start()
+            r.update_routes(("socks5", socks_port))
+
+            # A. HTTPS CONNECT through HTTP relay -> SOCKS5 upstream
+            with socket.create_connection(("127.0.0.1", rport), timeout=2.0) as s:
+                s.settimeout(2.0)
+                s.sendall(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+                status_buf = b""
+                while b"\r\n\r\n" not in status_buf:
+                    status_buf += s.recv(1024)
+                self.assertIn(b"200 Connection Established", status_buf)
+                s.sendall(b"PING_SOCKS5")
+                self.assertEqual(s.recv(1024), b"ECHO:PING_SOCKS5")
+
+            # B. Plain HTTP absolute-URI request through HTTP relay -> SOCKS5 upstream
+            with socket.create_connection(("127.0.0.1", rport), timeout=2.0) as s:
+                s.settimeout(2.0)
+                s.sendall(
+                    b"GET http://plain.test/api?x=1 HTTP/1.1\r\n"
+                    b"Host: plain.test\r\nProxy-Connection: keep-alive\r\n\r\n"
+                )
+                resp = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                self.assertIn(b"HTTP/1.1 200 OK", resp)
+                self.assertIn(b"GET /api?x=1 HTTP/1.1", resp)
+                self.assertNotIn(b"Proxy-Connection", resp)
+
+            self.assertIn(("example.test", 443), seen_domains)
+            self.assertIn(("plain.test", 80), seen_domains)
+        finally:
+            r.stop()
+            stop.set()
+            socks_srv.close()
+            target_srv.close()
+            t_socks.join(timeout=1.0)
+            t_target.join(timeout=1.0)
+
+    def test_universal_gui_framework_ipc_protection(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            fl_dir = root / "flutter_vpn"
+            fl_dir.mkdir()
+            fl_exe = fl_dir / "mystery_vpn.exe"
+            fl_exe.touch()
+            (fl_dir / "flutter_windows.dll").touch()
+
+            el_dir = root / "electron_vpn"
+            (el_dir / "resources").mkdir(parents=True)
+            el_exe = el_dir / "electron_vpn.exe"
+            el_exe.touch()
+            (el_dir / "resources" / "app.asar").touch()
+
+            ta_dir = root / "tauri_vpn"
+            ta_dir.mkdir()
+            ta_exe = ta_dir / "tauri_vpn.exe"
+            ta_exe.touch()
+            (ta_dir / "WebView2Loader.dll").touch()
+
+            core_dir = root / "plain_core"
+            core_dir.mkdir()
+            core_exe = core_dir / "custom_core.exe"
+            core_exe.touch()
+
+            self.assertTrue(proxies.is_gui_framework_executable(fl_exe, is_mac=False))
+            self.assertTrue(proxies.is_gui_framework_executable(el_exe, is_mac=False))
+            self.assertTrue(proxies.is_gui_framework_executable(ta_exe, is_mac=False))
+            self.assertFalse(proxies.is_gui_framework_executable(core_exe, is_mac=False))
+
+            # Unknown Flutter GUI owns ephemeral IPC port 41234 AND common proxy port 7890
+            procs = {77: ("mystery_vpn.exe", 1)}
+            listeners = [(77, "127.0.0.1", 41234), (77, "127.0.0.1", 7890)]
+            probed_ports: list[int] = []
+
+            def record_probe(port, label):
+                probed_ports.append(port)
+                return (None, False)
+
+            with patch.object(proxies, "scan_whitelabel_processes", return_value={}), \
+                    patch.object(proxies, "process_executable_path", return_value=fl_exe), \
+                    patch.object(proxies, "windows_active_proxy_pipes", return_value=[]), \
+                    patch.object(proxies, "windows_existing_pipes", return_value=set()), \
+                    patch.object(proxies, "discover_flclash_family_configs", return_value=[]):
+                snap = proxies.discover_proxies(
+                    procs, listeners, sys_port=None, env_ports=[], static_controllers=[],
+                    is_mac=False, detected_apps={}, probe_controller=record_probe,
+                )
+            self.assertNotIn(41234, probed_ports)
+            self.assertNotIn(41234, [c.port for c in snap.http_proxies])
+            self.assertIn(7890, probed_ports)
+            self.assertIn(7890, [c.port for c in snap.http_proxies])
+
+    def test_custom_named_tun_route_and_transparent_router_proxy_fallback(self):
+        # Unknown VPN adapter name NOT matching TUN_ADAPTER_PATTERN, but owning a lower-metric CGNAT default route
+        custom_vpn_route = """
+Interface List
+  4...........................MyCustomVPN Adapter
+ 19...00 e0 4c a8 0a 19 ......Realtek PCIe GbE Family Controller
+Active Routes:
+          0.0.0.0          0.0.0.0      192.168.1.1      192.168.1.50     35
+          0.0.0.0          0.0.0.0       100.64.0.2       100.64.0.1       5
+"""
+        dual_lan_only = """
+Interface List
+ 19...00 e0 4c a8 0a 19 ......Realtek PCIe GbE Family Controller
+ 20...00 e0 4c a8 0a 20 ......Intel Wi-Fi 6 AX201
+Active Routes:
+          0.0.0.0          0.0.0.0      192.168.1.1      192.168.1.50     35
+          0.0.0.0          0.0.0.0      192.168.2.1      192.168.2.50     25
+"""
+        self.assertTrue(proxies.parse_windows_tun_routes(custom_vpn_route))
+        self.assertFalse(proxies.parse_windows_tun_routes(dual_lan_only))
+
+        # Transparent router / 旁路由 fallback when detect_system_tun() is False and 0 local proxies exist
+        empty_snap = proxies.DiscoverySnapshot(detected_apps={}, controllers=(), http_proxies=(), controller_sibling_ports={}, hints=())
+        good_probe = app.Probe("chatgpt.com", True, "HTTP 200", "tun_route", 90, "", "US")
+        with patch.object(app, "discover_live_proxies", return_value=empty_snap), \
+                patch.object(app, "detect_system_tun", return_value=False), \
+                patch.object(proxies, "probe_exit_region", return_value=("US", 80)), \
+                patch.object(app, "_probe_hosts_and_region", return_value=([good_probe], "US", 90)):
+            reports, _ = app.check_reports(["chatgpt.com"], True)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual((reports[0].provider, reports[0].port, reports[0].tun, reports[0].scheme), ("透明代理 / 旁路由", 0, True, "tun"))
+
+        # Must NOT false-positive when direct exit is CN or empty
+        for direct_reg in ("CN", ""):
+            with patch.object(app, "discover_live_proxies", return_value=empty_snap), \
+                    patch.object(app, "detect_system_tun", return_value=False), \
+                    patch.object(proxies, "probe_exit_region", return_value=(direct_reg, 20)):
+                reports, _ = app.check_reports(["chatgpt.com"], False)
+            self.assertEqual(reports, [])
+
+    def test_socks5_only_client_auto_verified_and_manual_socks5_fallback(self):
+        snap = proxies.DiscoverySnapshot(
+            controllers=[],
+            http_proxies=[proxies.HTTPProxyCandidate(1080, "Shadowsocks", "process", 10)],
+            detected_apps={"Shadowsocks": None},
+            hints=[],
+        )
+        ok_probe = app.Probe("chatgpt.com", True, "HTTP 200", "socks5_proxy", 95, "", "JP")
+        hints: list[str] = []
+        with patch.object(app, "discover_live_proxies", return_value=snap), \
+                patch.object(app, "probe_http_proxy_port", return_value="socks5"), \
+                patch.object(app, "_probe_hosts_and_region", return_value=([ok_probe], "JP", 95)):
+            reports, _ = app.check_reports(["chatgpt.com"], False, hints=hints)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual((reports[0].provider, reports[0].port, reports[0].scheme), ("Shadowsocks", 1080, "socks5"))
+        self.assertTrue(any("桥接" in h for h in hints))
+
+        # Manual port mode falls back to SOCKS5 when HTTP probe fails and port speaks SOCKS5
+        fail_http = app.Report("http", False, {"chatgpt.com": app.Probe("chatgpt.com", False, "中断")}, 1080, provider="手动端口 :1080")
+        ok_socks = app.Report("socks5", False, {"chatgpt.com": ok_probe}, 1080, provider="手动端口 :1080", region="JP", scheme="socks5")
+        with patch.object(app, "detect_system_tun", return_value=False), \
+                patch.object(app, "check_http_proxy", return_value=fail_http), \
+                patch.object(proxies, "probe_socks5_port", return_value=True), \
+                patch.object(app, "check_socks5_proxy", return_value=ok_socks):
+            manual_rep = app.check(1080, ["chatgpt.com"], app.MANUAL)
+        self.assertEqual((manual_rep.scheme, manual_rep.port), ("socks5", 1080))
+
+    def test_universal_flclash_family_passive_config_discovery(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "com.follow"
+            brand_dir = root / "任意自定义机场"
+            brand_dir.mkdir(parents=True)
+            inner = json.dumps({"patchClashConfig": {"mixed-port": 18899, "tun": {"enable": True}}})
+            (brand_dir / "shared_preferences.json").write_text(
+                json.dumps({"flutter.config": inner}), encoding="utf-8",
+            )
+            found = proxies.discover_flclash_family_configs(is_mac=False, base_dirs=(root,))
+            self.assertEqual(found, [("任意自定义机场", 18899, True)])
+
+            # Only added to discover_proxies when the configured port is genuinely listening
+            with patch.object(proxies, "scan_whitelabel_processes", return_value={}), \
+                    patch.object(proxies, "windows_active_proxy_pipes", return_value=[]), \
+                    patch.object(proxies, "windows_existing_pipes", return_value=set()), \
+                    patch.object(proxies, "discover_flclash_family_configs", return_value=found):
+                dead_snap = proxies.discover_proxies(
+                    {99: ("renamed_core.exe", 1)}, [], sys_port=None, env_ports=[], static_controllers=[],
+                    is_mac=False, detected_apps={}, probe_controller=lambda p, n: (None, False),
+                )
+                live_snap = proxies.discover_proxies(
+                    {99: ("renamed_core.exe", 1)}, [(99, "127.0.0.1", 18899)], sys_port=None, env_ports=[], static_controllers=[],
+                    is_mac=False, detected_apps={}, probe_controller=lambda p, n: (None, False),
+                )
+            self.assertFalse(any(c.port == 18899 for c in dead_snap.http_proxies))
+            self.assertTrue(any(c.port == 18899 and c.name == "任意自定义机场" for c in live_snap.http_proxies))
+
 
 if __name__ == "__main__":
     unittest.main()

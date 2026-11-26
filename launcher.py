@@ -25,6 +25,7 @@ if sys.platform == "win32":
     import winreg
 import macos
 import proxies
+import relay
 import win32net
 from proxies import (
     CLASH_HOME,
@@ -56,11 +57,12 @@ CODEX_RESPONSES = "chatgpt.com/backend-api/codex/responses"
 LABELS = {
     "proxy": "节点代理",
     "http_proxy": "代理连通",
+    "socks5_proxy": "SOCKS5 代理连通",
     "tun_route": "系统路由连通",
     "direct": "直连",
     "unknown": "未确认出口",
 }
-PASSING_ROUTES = {"proxy", "http_proxy", "tun_route"}
+PASSING_ROUTES = {"proxy", "http_proxy", "socks5_proxy", "tun_route"}
 SUPPORTED_WIN_BROWSERS = {
     "msedge.exe": "Microsoft Edge",
     "chrome.exe": "Google Chrome",
@@ -137,6 +139,7 @@ class Report:
     endpoint: Controller | None = field(default=None, repr=False)
     region: str = ""
     latency_ms: int | None = None
+    scheme: str = "http"
 
 
 def parse_port(value: str) -> int:
@@ -800,8 +803,20 @@ def open_tunnel(host: str, port: int, timeout: float) -> tuple[socket.socket | N
     return None, detail
 
 
+def open_socks5_tunnel(host: str, port: int, timeout: float = 8) -> tuple[socket.socket | None, str]:
+    try:
+        conn = relay.dial_socks5_upstream(port, host, 443, timeout=timeout)
+        return conn, ""
+    except ConnectionRefusedError:
+        return None, "本机 SOCKS5 代理端口未开启"
+    except TimeoutError:
+        return None, "本机 SOCKS5 代理响应超时"
+    except OSError:
+        return None, "无法通过本机 SOCKS5 代理建立连接"
+
+
 def connect_probe(service: str, port: int | None, timeout: float = 8, endpoint: Controller | None = None,
-                  *, allow_uncontrolled: bool = False) -> Probe:
+                  *, allow_uncontrolled: bool = False, scheme: str = "http") -> Probe:
     started = time.perf_counter()
     host, _, path = service.partition("/")
     if port is None:
@@ -810,7 +825,10 @@ def connect_probe(service: str, port: int | None, timeout: float = 8, endpoint: 
         except OSError:
             return Probe(service, False, "系统路由连接失败")
     else:
-        connection, detail = open_tunnel(host, port, timeout)
+        if scheme == "socks5":
+            connection, detail = open_socks5_tunnel(host, port, timeout)
+        else:
+            connection, detail = open_tunnel(host, port, timeout)
         if connection is None:
             return Probe(service, False, detail)
     with connection:
@@ -835,7 +853,12 @@ def connect_probe(service: str, port: int | None, timeout: float = 8, endpoint: 
                                 node = chains[0].strip() if chains else ""
                                 break
                 elif allow_uncontrolled:
-                    route = "http_proxy" if port is not None else "tun_route"
+                    if port is None:
+                        route = "tun_route"
+                    elif scheme == "socks5":
+                        route = "socks5_proxy"
+                    else:
+                        route = "http_proxy"
                 inferred_region = proxies.infer_region_from_node(node) if node else ""
                 if host in {"claude.ai", "chatgpt.com", "gemini.google.com", "antigravity.google.com"} or service in {OAUTH_TOKEN, DAILY_CODE_ASSIST}:
                     method = "HEAD"
@@ -879,10 +902,13 @@ def connect_probe(service: str, port: int | None, timeout: float = 8, endpoint: 
     return Probe(service, False, detail)
 
 
-def probe_with_retry(host: str, port: int | None, endpoint: Controller | None, *, allow_uncontrolled: bool = False) -> Probe:
-    kwargs = {"endpoint": endpoint}
+def probe_with_retry(host: str, port: int | None, endpoint: Controller | None, *, allow_uncontrolled: bool = False,
+                     scheme: str = "http") -> Probe:
+    kwargs: dict = {"endpoint": endpoint}
     if allow_uncontrolled:
         kwargs["allow_uncontrolled"] = True
+    if scheme != "http":
+        kwargs["scheme"] = scheme
     first = connect_probe(host, port, **kwargs)
     if first.route != "direct" and not first.connected and first.detail in {
         "端口有响应，服务连接超时", "端口有响应，服务连接中断",
@@ -916,7 +942,7 @@ def _controller_ports(config: dict, endpoint: Controller,
 
 
 def _probe_hosts_and_region(hosts: list[str], port: int | None, endpoint: Controller | None,
-                            *, allow_uncontrolled: bool = False) -> tuple[list[Probe], str, int | None]:
+                            *, allow_uncontrolled: bool = False, scheme: str = "http") -> tuple[list[Probe], str, int | None]:
     # Probe per-AI-domain Cloudflare trace (chatgpt.com / claude.ai) when those domains are checked,
     # rather than relying only on www.cloudflare.com which can sit in a different rule group!
     trace_hosts: list[str] = []
@@ -928,8 +954,13 @@ def _probe_hosts_and_region(hosts: list[str], port: int | None, endpoint: Contro
         trace_hosts.append("www.cloudflare.com")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, max(2, len(hosts) + len(trace_hosts)))) as pool:
-        trace_futures = {th: pool.submit(proxies.probe_exit_region, port, 3.0, th) for th in trace_hosts}
-        if allow_uncontrolled:
+        if scheme != "http":
+            trace_futures = {th: pool.submit(proxies.probe_exit_region, port, 3.0, th, scheme=scheme) for th in trace_hosts}
+        else:
+            trace_futures = {th: pool.submit(proxies.probe_exit_region, port, 3.0, th) for th in trace_hosts}
+        if allow_uncontrolled and scheme != "http":
+            probe_futures = [pool.submit(probe_with_retry, host, port, None, allow_uncontrolled=True, scheme=scheme) for host in hosts]
+        elif allow_uncontrolled:
             probe_futures = [pool.submit(probe_with_retry, host, port, None, allow_uncontrolled=True) for host in hosts]
         else:
             probe_futures = [pool.submit(probe_with_retry, host, port, endpoint) for host in hosts]
@@ -977,18 +1008,34 @@ def check_http_proxy(port: int, hosts: list[str], provider: str, *, tun: bool | 
     return Report(
         "http", tun, {probe.host: probe for probe in probes}, port,
         provider=provider, endpoint=None, region=region, latency_ms=latency_ms,
+        scheme="http",
     )
 
 
-def check_tun_only(hosts: list[str], provider: str = "系统 TUN") -> Report | None:
-    """Validate pure-TUN proxy setups that expose no local HTTP port (common in white-label clients)."""
+def check_socks5_proxy(port: int, hosts: list[str], provider: str, *, tun: bool | None = None) -> Report:
+    """Validate a SOCKS5-only local proxy directly; apps will auto-bridge via the local HTTP relay."""
+    probes, region, latency_ms = _probe_hosts_and_region(
+        hosts, port, None, allow_uncontrolled=True, scheme="socks5",
+    )
+    return Report(
+        "socks5", tun, {probe.host: probe for probe in probes}, port,
+        provider=provider, endpoint=None, region=region, latency_ms=latency_ms,
+        scheme="socks5",
+    )
+
+
+def check_tun_only(hosts: list[str], provider: str = "系统 TUN", *, require_non_cn_region: bool = False) -> Report | None:
+    """Validate pure-TUN or router/旁路由 transparent proxy setups that expose no local HTTP port."""
     probes, region, latency_ms = _probe_hosts_and_region(hosts, None, None, allow_uncontrolled=True)
     connected = [p for p in probes if p.connected and p.route in PASSING_ROUTES]
     if not connected or region.upper() == "CN":
         return None
+    if require_non_cn_region and not region:
+        return None
     return Report(
         "tun", True, {probe.host: probe for probe in probes}, 0,
         provider=provider, endpoint=None, region=region, latency_ms=latency_ms,
+        scheme="tun",
     )
 
 
@@ -1011,7 +1058,11 @@ def check(port: int | None, hosts: list[str], provider: str = "JImmm", custom: C
                     provider=custom.name or f"自定义代理 :{port}", endpoint=custom,
                     region=region, latency_ms=latency_ms,
                 )
-        return check_http_proxy(port, hosts, f"手动端口 :{port}", tun=detect_system_tun())
+        tun_on = detect_system_tun()
+        http_rep = check_http_proxy(port, hosts, f"手动端口 :{port}", tun=tun_on)
+        if not any(p.connected for p in http_rep.probes.values()) and proxies.probe_socks5_port(port, timeout=0.4):
+            return check_socks5_proxy(port, hosts, f"手动端口 :{port}", tun=tun_on)
+        return http_rep
 
     default_port = DEFAULT_PORTS.get(provider, 0)
     snapshot: proxies.DiscoverySnapshot | None = None
@@ -1064,7 +1115,13 @@ def check(port: int | None, hosts: list[str], provider: str = "JImmm", custom: C
         return Report("", None, {}, port or default_port, issue, provider)
 
     if provider not in {"JImmm", "Clash"}:
+        if provider in {"系统 TUN", "透明代理 / 旁路由"} and port is None:
+            tun_rep = check_tun_only(hosts, provider, require_non_cn_region=(provider == "透明代理 / 旁路由"))
+            if tun_rep is not None:
+                return tun_rep
+            return Report("", False, {}, 0, f"{provider} 当前无法连通目标 AI 服务。", provider)
         target_port = port
+        socks_fallback_port: int | None = None
         if target_port is None and snapshot:
             matching = [item for item in snapshot.http_proxies if item.name.casefold() == provider.casefold()]
             if not matching and provider == "系统代理":
@@ -1072,11 +1129,19 @@ def check(port: int | None, hosts: list[str], provider: str = "JImmm", custom: C
                 if sys_port:
                     target_port = sys_port
             for candidate in matching:
-                if candidate.source in {"system", "env"} or probe_http_proxy_port(candidate.port, test_host=first_host) == "http_proxy":
+                if candidate.source in {"system", "env"}:
                     target_port = candidate.port
                     break
+                kind = probe_http_proxy_port(candidate.port, test_host=first_host)
+                if kind == "http_proxy":
+                    target_port = candidate.port
+                    break
+                if kind == "socks5" and socks_fallback_port is None:
+                    socks_fallback_port = candidate.port
         if target_port:
             return check_http_proxy(target_port, hosts, provider, tun=detect_system_tun())
+        if socks_fallback_port:
+            return check_socks5_proxy(socks_fallback_port, hosts, provider, tun=detect_system_tun())
         issue = f"未检测到 {provider} 的可用本地代理端口。请先打开 {provider} 并开启 HTTP / 混合代理端口，或手动填写端口。"
         return Report("", None, {}, port or default_port, issue, provider)
 
@@ -1179,33 +1244,70 @@ def check_reports(hosts: list[str], needs_tun: bool, custom: Controller | None =
             elif kind == "socks5":
                 socks_only_by_name.setdefault(cand.name, []).append(cand.port)
 
-    if hints is not None:
-        for name, ports in socks_only_by_name.items():
-            if name.casefold() not in confirmed_names:
-                port_text = "、".join(f":{p}" for p in sorted(set(ports)))
+    controller_owns_tun = any(report.tun is True for report in controller_reports)
+    os_tun: bool | None = None
+
+    def _get_os_tun() -> bool:
+        nonlocal os_tun
+        if os_tun is None:
+            os_tun = False if controller_owns_tun else detect_system_tun()
+        return os_tun
+
+    http_reports: list[Report] = []
+    if selected_http:
+        tun_flag = _get_os_tun()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(selected_http))) as pool:
+            http_reports = list(pool.map(
+                lambda cand: check_http_proxy(cand.port, hosts, cand.name, tun=tun_flag),
+                selected_http,
+            ))
+
+    # Auto-verify and bridge SOCKS5-only clients (e.g. Shadowsocks, SSH -D, Tor, sing-box/xray SOCKS inbound)
+    socks_reports: list[Report] = []
+    socks_candidates = [
+        (name, sorted(set(ports)))
+        for name, ports in socks_only_by_name.items()
+        if name.casefold() not in confirmed_names
+    ]
+    if socks_candidates:
+        tun_flag = _get_os_tun()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(socks_candidates))) as pool:
+            probed_socks = list(pool.map(
+                lambda item: (item[0], item[1], check_socks5_proxy(item[1][0], hosts, item[0], tun=tun_flag)),
+                socks_candidates,
+            ))
+        for name, ports, srep in probed_socks:
+            if any(p.connected and p.route in PASSING_ROUTES for p in srep.probes.values()):
+                socks_reports.append(srep)
+                confirmed_names.add(name.casefold())
+                if hints is not None:
+                    note = f"检测到 {name} 仅监听 SOCKS5 端口（:{ports[0]}），已自动通过内置中继桥接为本地 HTTP 代理。"
+                    if note not in hints:
+                        hints.append(note)
+            elif hints is not None:
+                port_text = "、".join(f":{p}" for p in ports)
                 note = f"检测到 {name} 仅监听 SOCKS5 端口（{port_text}），请在代理软件中开启 HTTP 或 Mixed 混合代理端口。"
                 if note not in hints:
                     hints.append(note)
 
-    http_reports: list[Report] = []
-    if selected_http:
-        controller_owns_tun = any(report.tun is True for report in controller_reports)
-        os_tun = False if controller_owns_tun else detect_system_tun()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(selected_http))) as pool:
-            http_reports = list(pool.map(
-                lambda cand: check_http_proxy(cand.port, hosts, cand.name, tun=os_tun),
-                selected_http,
-            ))
-
-    reports = [report for report in (*controller_reports, *http_reports) if not report.issue]
+    reports = [report for report in (*controller_reports, *http_reports, *socks_reports) if not report.issue]
     any_healthy = any(
         any(p.connected and p.route in PASSING_ROUTES for p in r.probes.values())
         for r in reports
     )
-    if not any_healthy and detect_system_tun():
-        tun_report = check_tun_only(hosts, "系统 TUN")
-        if tun_report is not None:
-            reports.append(tun_report)
+    if not any_healthy:
+        if detect_system_tun():
+            tun_report = check_tun_only(hosts, "系统 TUN")
+            if tun_report is not None:
+                reports.append(tun_report)
+        else:
+            # Universal ground-truth fallback for unknown TUN VPNs, WireGuard, or router/旁路由 transparent gateways:
+            # 1-shot Cloudflare trace on chatgpt.com; strictly requires a confirmed non-CN exit country.
+            direct_region, _ = proxies.probe_exit_region(None, 2.0, "chatgpt.com")
+            if direct_region and direct_region.upper() != "CN":
+                tun_report = check_tun_only(hosts, "透明代理 / 旁路由", require_non_cn_region=True)
+                if tun_report is not None:
+                    reports.append(tun_report)
     for report in reports:
         detected.setdefault(report.provider, None)
     return reports, tuple(detected)

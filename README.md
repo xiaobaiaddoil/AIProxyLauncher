@@ -68,10 +68,10 @@
 
 - **通用代理与套壳客户端 4 层零名单适配**
   - 原生适配 Clash Verge Rev、Clash Party / Mihomo Party、JImmm、FlClash、Clash Nyanpasu、Sparkle、ClashX、Stash、Surge、v2rayN、Hiddify、NekoBox / Throne、Karing、Shadowsocks、Xray / Sing-box 等 20+ 客户端。
-  - **目录骨架指纹 + 真实品牌名识别**：无需维护机场名单，自动识别改名套壳的 FlClash / Mihomo / Sing-box / Xray 客户端，并直接读取 Windows PE 版本信息或 macOS `Info.plist` 显示真实品牌名。
-  - **协议优先嗅探 + 纯 TUN 无端口兜底**：自动嗅探常见代理端口的 Clash API / HTTP / SOCKS5 协议与自定义命名管道 / Unix Socket；仅开启系统 TUN 无本地端口时自动直通校验；系统代理指向死端口或外壳在跑但内核未启动时精准提示原因。
-- **统一本地中继（换代理免重启 · 网页免重登）**
-  - 点击顶部 `⇄ 统一中继` 在 `127.0.0.1:17890` 启动纯标准库 HTTP/CONNECT 稳定中继层（[relay.py](relay.py)）。
+  - **目录骨架指纹 + 通用 GUI 框架 IPC 防护**：无需维护机场名单，自动识别改名套壳的 FlClash / Mihomo / Sing-box / Xray 客户端并读取 PE / `Info.plist` 真实品牌名；自动识别 Flutter / Electron / Tauri / Qt 等 GUI 前端进程，绝不误探测随机内部 IPC 端口，并被动读取 FlClash 家族共享配置。
+  - **全协议自动桥接 + 透明代理 / 旁路由通用兜底**：自动发现 Clash API / HTTP / SOCKS5 代理；遇到仅开放 **SOCKS5** 的客户端（如 Shadowsocks、SSH `-D`、Tor、sing-box/xray SOCKS 入站）时，通过纯标准库 RFC 1928 本地桥接自动转为 HTTP 中继供所有应用使用；无本地代理端口时，支持任意自定义命名 TUN/VPN 及**旁路由 / 路由器透明代理**的端到端实测直通。
+- **统一本地中继（换代理免重启 · 网页免重登 · HTTP/SOCKS5 双协议上游）**
+  - 点击顶部 `⇄ 统一中继` 在 `127.0.0.1:17890` 启动纯标准库 HTTP/CONNECT 稳定中继层（[relay.py](relay.py)），上游同时支持本地 HTTP 与 SOCKS5 代理。
   - 独立网页窗口共用固定浏览器资料目录，切换代理软件不再掉登录；后台按域名热切换上游并支持 `350ms` 快速故障转移，无可用上游时严格返回 `HTTP 502`，绝不直连泄漏。
 - **按 AI 服务精准识别出口节点与地区**
   - 直接针对 `chatgpt.com`、`claude.ai` 等 AI 域名探测出口地区，并从 Clash `/connections` 实时提取 12+ 项服务各自命中的出站节点名与延迟；遇受限地区自动高亮提醒并在择优与换节点时自动避开。
@@ -96,7 +96,7 @@ python launcher.py --minimized
 # 命令行探针检查（输出 JSON）
 python launcher.py --check
 
-# 运行全量单元测试（72 项）
+# 运行全量单元测试（77 项）
 python -B -m unittest -v
 ```
 

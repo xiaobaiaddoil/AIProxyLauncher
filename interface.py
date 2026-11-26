@@ -93,6 +93,7 @@ class LauncherWindow:
         self.controls: list = []
         self.results: queue.Queue = queue.Queue()
         self.busy = False
+        self._socks_bridge_active = False
         self.container: tk.Frame | None = None
         self.tray_icon: tray.SystemTray | None = None
 
@@ -472,19 +473,21 @@ class LauncherWindow:
         if not hasattr(self, "relay_button"):
             return
         p = self.p
-        if self.relay_enabled and self.relay.running and self.relay.port:
+        if (self.relay_enabled or self._socks_bridge_active) and self.relay.running and self.relay.port:
             active, total, upstream = self.relay.stats()
-            self.relay_button.set_text(f"⇄ 中继 :{self.relay.port}")
+            label = f"⇄ 中继 :{self.relay.port}" if self.relay_enabled else f"⇄ SOCKS5桥 :{self.relay.port}"
+            self.relay_button.set_text(label)
             self.relay_button.set_palette(
                 fill="#0F3430", hover_fill="#134E4A", fg="#5EEAD4",
                 outline=TEAL, hover_outline="#2DD4BF",
             )
             if self.relay_button.tooltip:
                 up = f"127.0.0.1:{upstream}" if upstream else "等待可用代理"
+                mode_desc = "统一本地中继运行中" if self.relay_enabled else "已自动启用 SOCKS5 → HTTP 本地桥接"
                 self.relay_button.tooltip.set_text(
-                    f"统一本地中继运行中（127.0.0.1:{self.relay.port} → {up}）\n"
+                    f"{mode_desc}（127.0.0.1:{self.relay.port} → {up}）\n"
                     f"已转发 {total} 次请求 · 当前活跃 {active} 连接\n"
-                    "关闭窗口会自动驻留托盘以保持中继不断开；再次点击可关闭中继。"
+                    "关闭窗口会自动驻留托盘以保持中继不断开；再次点击可切换统一中继。"
                 )
         else:
             self.relay_button.set_text("⇄ 统一中继")
@@ -496,24 +499,41 @@ class LauncherWindow:
                 self.relay_button.tooltip.set_text(
                     "开启后所有应用固定走 127.0.0.1:17890 中继端口：\n"
                     "• 浏览器共用唯一资料目录，切换代理软件无需重新登录\n"
-                    "• 后台按域名自动热切换上游代理，免重启已打开的应用"
+                    "• 后台按域名自动热切换上游代理（同时支持 HTTP 与 SOCKS5），免重启已打开的应用"
                 )
 
+    @staticmethod
+    def _report_upstream(report: Report) -> int | tuple[str, int]:
+        return ("socks5", report.port) if report.scheme == "socks5" else report.port
+
     def _sync_relay_routes(self, available: list[Report], preferred: int | None) -> None:
-        if not (self.relay_enabled and self.relay.running):
+        port_reports = [r for r in available if not r.issue and r.port > 0]
+        needs_socks_bridge = any(r.scheme == "socks5" for r in port_reports)
+        if needs_socks_bridge and not self.relay.running:
+            try:
+                self.relay.start()
+                self._socks_bridge_active = True
+            except OSError:
+                self._socks_bridge_active = False
+        elif not self.relay_enabled and not needs_socks_bridge and self._socks_bridge_active:
+            self.relay.stop()
+            self._socks_bridge_active = False
+        if not self.relay.running:
+            self._update_relay_button()
             return
-        if not available:
+        if not port_reports:
             self.relay.update_routes(None, {}, [])
             self._update_relay_button()
             return
-        host_upstreams: dict[str, int] = {}
+        host_upstreams: dict[str, int | tuple[str, int]] = {}
         for target in self.targets.values():
-            best = app_report(target, available, preferred)
-            if best and not best.issue and best.port:
+            best = app_report(target, port_reports, preferred)
+            if best and not best.issue and best.port > 0:
+                spec = self._report_upstream(best)
                 for host in target.hosts:
-                    host_upstreams[host.split("/", 1)[0]] = best.port
+                    host_upstreams[host.split("/", 1)[0]] = spec
         ordered = sorted(
-            available,
+            port_reports,
             key=lambda r: (
                 not proxies.is_restricted_region(r.region),
                 r.port == preferred,
@@ -522,8 +542,8 @@ class LauncherWindow:
             ),
             reverse=True,
         )
-        default_up = ordered[0].port
-        fallbacks = [r.port for r in ordered[1:] if r.port]
+        default_up = self._report_upstream(ordered[0])
+        fallbacks = [self._report_upstream(r) for r in ordered[1:]]
         self.relay.update_routes(default_up, host_upstreams, fallbacks)
         self._update_relay_button()
 
@@ -532,12 +552,19 @@ class LauncherWindow:
             return
         if self.relay_enabled:
             self.relay_enabled = False
-            self.relay.stop()
-            self.write("已关闭统一本地中继，后续打开的应用将直连代理软件实际端口。")
+            needs_socks = any(r.scheme == "socks5" and r.port > 0 and not r.issue for r in self.last_available)
+            if needs_socks and self.relay.running:
+                self._socks_bridge_active = True
+                self.write("已关闭统一中继模式；因当前使用 SOCKS5 代理，本地桥接端口将保持运行。")
+            else:
+                self._socks_bridge_active = False
+                self.relay.stop()
+                self.write("已关闭统一本地中继，后续打开的应用将直连代理软件实际端口。")
         else:
             try:
                 port = self.relay.start()
                 self.relay_enabled = True
+                self._socks_bridge_active = False
                 self._sync_relay_routes(self.last_available, system_proxy_port())
                 self.write(f"已启动统一本地中继 127.0.0.1:{port}（网页将共用持久资料免重登，换代理可后台热切换）。", "good")
             except OSError as err:
@@ -592,8 +619,8 @@ class LauncherWindow:
             self.begin(keys, opening)
 
     def on_window_close(self) -> None:
-        # Keep running in tray if user enabled minimize_to_tray OR active local relay needs to stay alive
-        if (self.minimize_to_tray.get() or (self.relay_enabled and self.relay.running)) and self.tray_icon:
+        # Keep running in tray if user enabled minimize_to_tray OR active local relay/SOCKS5 bridge needs to stay alive
+        if (self.minimize_to_tray.get() or ((self.relay_enabled or self._socks_bridge_active) and self.relay.running)) and self.tray_icon:
             self.hide_to_tray()
             return
         self.force_exit()
@@ -727,14 +754,23 @@ class LauncherWindow:
                 meta_parts.append(f"{report.latency_ms}ms")
             meta_str = " · ".join(meta_parts)
 
-            badge = "TUN" if report.tun else ("HTTP" if report.endpoint is None else "API")
-            badge_bg = "#6EE7B7" if report.tun else ("#BAE6FD" if report.endpoint is None else "#C7D2FE")
-            badge_fg = "#064E3B" if report.tun else ("#0C4A6E" if report.endpoint is None else "#312E81")
+            if report.scheme == "socks5":
+                badge, badge_bg, badge_fg = "SOCKS5", "#FDE68A", "#78350F"
+            elif report.tun:
+                badge, badge_bg, badge_fg = "TUN", "#6EE7B7", "#064E3B"
+            elif report.endpoint is None:
+                badge, badge_bg, badge_fg = "HTTP", "#BAE6FD", "#0C4A6E"
+            else:
+                badge, badge_bg, badge_fg = "API", "#C7D2FE", "#312E81"
             pinned = self.provider == report.provider
             port_text = f":{report.port}" if report.port else ""
-            tip_lines = [
-                f"{report.provider}  127.0.0.1:{report.port}" if report.port else f"{report.provider}  系统 TUN 直通（无本地 HTTP 端口）"
-            ]
+            if report.scheme == "socks5" and report.port:
+                head_tip = f"{report.provider}  socks5://127.0.0.1:{report.port}（已自动桥接为本地 HTTP 中继）"
+            elif report.port:
+                head_tip = f"{report.provider}  127.0.0.1:{report.port}"
+            else:
+                head_tip = f"{report.provider}  系统路由 / 透明代理直通（无需本地端口）"
+            tip_lines = [head_tip]
             if region_txt:
                 tip_lines.append(f"AI 出口地区：{region_txt}（{report.region}）" + (" — 部分 AI 平台可能限制该地区" if restricted else ""))
             if report.latency_ms is not None:
@@ -1232,14 +1268,18 @@ class LauncherWindow:
                 rname = proxies.region_label(report.region)
                 self.write(f"地区提示：{report.provider} 当前 AI 出口为 {rname}（{report.region}），部分平台可能受限，可点「切换节点」换至美/日/台/新等节点。", "error")
 
-        uncontrolled_http = [report.provider for report in available if report.endpoint is None and report.port > 0]
+        uncontrolled_http = [report.provider for report in available if report.endpoint is None and report.port > 0 and report.scheme != "socks5"]
         if uncontrolled_http:
             names = "、".join(dict.fromkeys(uncontrolled_http))
             self.write(f"提示：{names} 未开放 Clash 控制接口，已通过本地 HTTP 代理直接验证连通性。")
+        socks5_only = [report.provider for report in available if report.scheme == "socks5" and report.port > 0]
+        if socks5_only:
+            names = "、".join(dict.fromkeys(socks5_only))
+            self.write(f"提示：{names} 仅开放 SOCKS5 端口，已通过内置中继自动桥接为 HTTP 代理供全部应用使用。")
         tun_only = [report.provider for report in available if report.endpoint is None and report.port == 0 and report.tun]
         if tun_only:
             names = "、".join(dict.fromkeys(tun_only))
-            self.write(f"提示：{names} 未开放本地 HTTP 端口，已通过系统 TUN 路由直接验证连通性。")
+            self.write(f"提示：{names} 无需本地代理端口，已直接通过系统路由验证 AI 出口连通性。")
 
         use_relay = self.relay_enabled and self.relay.running and self.relay.port is not None
         opened = []
@@ -1253,12 +1293,13 @@ class LauncherWindow:
             target = self.targets[key]
             report = app_report(target, available, preferred)
             provider = report.provider or self.provider
-            can_relay = use_relay and report.port > 0
+            can_relay = (use_relay or report.scheme == "socks5") and self.relay.running and self.relay.port is not None and report.port > 0
             effective_port = self.relay.port if (can_relay and self.relay.port) else report.port
             if report.port <= 0 or (requires_tun(target) and target.kind != "electron"):
-                route = f"{provider} TUN"
+                route = provider if report.provider == "透明代理 / 旁路由" else f"{provider} TUN"
             elif can_relay:
-                route = f"中继 :{effective_port} → {provider}"
+                suffix = " SOCKS5" if report.scheme == "socks5" else ""
+                route = f"中继 :{effective_port} → {provider}{suffix}"
             else:
                 route = f"{provider} :{report.port}"
             probes_list = [report.probes[host] for host in target.hosts if host in report.probes]
@@ -1279,7 +1320,7 @@ class LauncherWindow:
                 path_key = "web" if target.kind == "web" else key
                 app_path = self.paths.get(path_key)
                 try:
-                    launch(target, app_path, effective_port, stable_profile=use_relay)
+                    launch(target, app_path, effective_port, stable_profile=can_relay)
                     opened.append(target.name)
                     self.tag(key, "已打开", TEAL)
                 except AlreadyRunningError:
@@ -1294,7 +1335,7 @@ class LauncherWindow:
                         self.tag(key, "需重启生效", AMBER)
                         self.write(f"{target.name} · 已在运行但未确认走 {route}，可在弹窗中选择「重启并切换代理」。")
                         if len(keys) == 1:
-                            restart_prompt = (key, target, app_path, effective_port, route, use_relay)
+                            restart_prompt = (key, target, app_path, effective_port, route, can_relay)
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     failed_open += 1
                     self.tag(key, "启动失败", ROSE)
@@ -1317,11 +1358,12 @@ class LauncherWindow:
         if opened:
             self.write("已请求打开 " + "、".join(opened) + "。", "good")
         for report in available:
+            port_label = f" :{report.port}" if report.port else " (系统路由)"
             for probe in report.probes.values():
                 tag = "good" if probe.connected and probe.route in PASSING_ROUTES else "error"
                 lat = f" · {probe.latency_ms}ms" if probe.latency_ms is not None else ""
                 node_txt = f" · {probe.node}" if probe.node else ""
-                self.write(f"{report.provider} :{report.port} · {probe.host} · {LABELS[probe.route]}{node_txt}{lat} · {probe.detail}", tag)
+                self.write(f"{report.provider}{port_label} · {probe.host} · {LABELS[probe.route]}{node_txt}{lat} · {probe.detail}", tag)
         self.log.see("1.0")
 
         if restart_prompt is not None:

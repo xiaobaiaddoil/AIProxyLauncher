@@ -349,6 +349,7 @@ class HTTPProxyCandidate:
     name: str
     source: str  # "system", "env", "process", "manual"
     pid: int | None = None
+    scheme: str = "http"
 
 
 @dataclass(frozen=True)
@@ -526,11 +527,38 @@ def parse_windows_tun_routes(output: str) -> bool:
     # Fake-IP interface (198.18.x.x) paired with a default route or active TUN interface.
     if fake_ip_ifaces and (any(iface in fake_ip_ifaces for iface, _ in defaults) or has_tun_adapter):
         return True
-    if not has_tun_adapter or not defaults:
+    if not defaults:
         return False
     best_metric = min(metric for _, metric in defaults)
     tun_prefixes = ("198.18.", "198.19.", "172.19.", "172.18.", "10.0.85.")
-    return any(iface.startswith(tun_prefixes) and metric <= best_metric for iface, metric in defaults)
+    if has_tun_adapter and any(iface.startswith(tun_prefixes) and metric <= best_metric for iface, metric in defaults):
+        return True
+    # Universal custom-named TUN/VPN takeover: multiple default routes where the highest-priority
+    # (strictly lowest metric) default route uses a tunnel/CGNAT address space (198.18/15, 172.16-31, 100.64-127, 10.x)
+    # beating the physical LAN gateway (e.g. 192.168.x.x).
+    if len(defaults) >= 2:
+        max_metric = max(metric for _, metric in defaults)
+        if best_metric < max_metric:
+            for iface, metric in defaults:
+                if metric == best_metric and _is_tunnel_ip_prefix(iface):
+                    return True
+    return False
+
+
+def _is_tunnel_ip_prefix(ip: str) -> bool:
+    parts = ip.split(".")
+    if len(parts) != 4 or not all(p.isdigit() for p in parts):
+        return False
+    a, b = int(parts[0]), int(parts[1])
+    if a == 198 and b in {18, 19}:
+        return True
+    if a == 100 and 64 <= b <= 127:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 10 and (b == 0 or b >= 8):
+        return True
+    return False
 
 
 def detect_system_tun(is_mac: bool = False) -> bool:
@@ -756,14 +784,23 @@ def create_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def probe_exit_region(port: int | None, timeout: float = 3.5, host: str = "www.cloudflare.com") -> tuple[str, int | None]:
-    """Read proxy exit country code and RTT (ms) via Cloudflare trace through local HTTP CONNECT or direct OS TUN."""
+def probe_exit_region(
+    port: int | None,
+    timeout: float = 3.5,
+    host: str = "www.cloudflare.com",
+    *,
+    scheme: str = "http",
+) -> tuple[str, int | None]:
+    """Read proxy exit country code and RTT (ms) via Cloudflare trace through HTTP CONNECT, SOCKS5, or direct OS TUN."""
     started = time.perf_counter()
     sock = None
     try:
         if port is None:
             sock = socket.create_connection((host, 443), timeout=timeout)
             sock.settimeout(timeout)
+        elif scheme == "socks5":
+            import relay
+            sock = relay.dial_socks5_upstream(port, host, 443, timeout=timeout)
         else:
             sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
             sock.settimeout(timeout)
@@ -959,6 +996,88 @@ def detect_whitelabel_proxy(exe_path: Path, *, is_mac: bool = False) -> tuple[st
 
     _WHITELABEL_CACHE[cache_key] = result
     return result
+
+
+_GUI_FRAMEWORK_MARKERS: frozenset[str] = frozenset({
+    "flutter_windows.dll", "webview2loader.dll", "qt6core.dll", "qt5core.dll",
+    "libcef.dll", "d3dcompiler_47.dll",
+})
+_GUI_SHELL_CACHE: dict[str, bool] = {}
+
+
+def is_gui_framework_executable(exe_path: Path, *, is_mac: bool = False) -> bool:
+    """Detect whether ANY executable is a desktop GUI frontend (Flutter/Electron/Tauri/Qt/CEF).
+
+    Random ephemeral TCP sockets owned by GUI frontends are internal UI<->Core IPC channels
+    and must NEVER be actively probed with HTTP requests (prevents breaking IPC like FlClash 'socket done').
+    """
+    key = str(exe_path).casefold()
+    if key in _GUI_SHELL_CACHE:
+        return _GUI_SHELL_CACHE[key]
+    found = False
+    try:
+        if is_mac:
+            bundle = next((p for p in exe_path.parents if p.suffix.lower() == ".app"), None)
+            if bundle:
+                fw = bundle / "Contents/Frameworks"
+                if fw.is_dir():
+                    names = {n.casefold() for n in os.listdir(fw)}
+                    found = any(tok in n for n in names for tok in ("flutter", "electron", "chromium", "qt"))
+        else:
+            parent = exe_path.parent
+            if parent.is_dir():
+                names = {n.casefold() for n in os.listdir(parent)}
+                if names & _GUI_FRAMEWORK_MARKERS:
+                    found = True
+                elif (parent / "resources" / "app.asar").is_file():
+                    found = True
+    except OSError:
+        found = False
+    _GUI_SHELL_CACHE[key] = found
+    return found
+
+
+def discover_flclash_family_configs(is_mac: bool = False, *, base_dirs: tuple[Path, ...] | None = None) -> list[tuple[str, int, bool]]:
+    """Passively read configured mixed-port & TUN state for ANY FlClash-family white-label client.
+
+    Every FlClash fork stores Flutter SharedPreferences under com.follow/<brand>/shared_preferences.json.
+    Returns [(brand_name, mixed_port, tun_enabled), ...].
+    """
+    roots = base_dirs
+    if roots is None:
+        if is_mac:
+            support = HOME / "Library/Application Support"
+            roots = (support / "com.follow", support / "com.follow.clash")
+        else:
+            roots = (ROAMING / "com.follow",)
+    results: list[tuple[str, int, bool]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            subdirs = [d for d in root.iterdir() if d.is_dir()]
+        except OSError:
+            continue
+        for sub in subdirs[:16]:
+            pref = sub / "shared_preferences.json"
+            if not pref.is_file():
+                continue
+            try:
+                raw = json.loads(pref.read_text(encoding="utf-8-sig"))
+                cfg_str = raw.get("flutter.config")
+                cfg = json.loads(cfg_str) if isinstance(cfg_str, str) else (cfg_str if isinstance(cfg_str, dict) else {})
+                patch = cfg.get("patchClashConfig") or {}
+                port = patch.get("mixed-port") or patch.get("port") or 0
+                tun_cfg = patch.get("tun") or {}
+                tun_on = tun_cfg.get("enable") is True if isinstance(tun_cfg, dict) else False
+                if isinstance(port, int) and 1 <= port <= 65535:
+                    brand = sub.name.strip() or "FlClash"
+                    if brand.casefold() == "clash":
+                        brand = "FlClash"
+                    results.append((brand, port, tun_on))
+            except (OSError, ValueError, TypeError):
+                continue
+    return results
 
 
 def scan_whitelabel_processes(
@@ -1282,6 +1401,14 @@ def discover_proxies(
     for pid, (proc_name, _ppid) in processes.items():
         if proc_name.casefold() in gui_shell_exes:
             gui_shell_pids.add(pid)
+    # Universal framework guard: ANY unknown Flutter/Electron/Tauri/Qt GUI process listening on ports
+    # is treated as a GUI shell so we never poke arbitrary ephemeral IPC ports on any desktop client.
+    for pid in {p for p, _, _ in listeners}:
+        if pid in gui_shell_pids or identify_process_proxy(pid, processes):
+            continue
+        exe = process_executable_path(pid)
+        if exe and exe.is_file() and is_gui_framework_executable(exe, is_mac=is_mac):
+            gui_shell_pids.add(pid)
 
     def _safe_to_probe(pid: int, port: int) -> bool:
         if pid not in gui_shell_pids:
@@ -1474,6 +1601,19 @@ def discover_proxies(
     proc_candidates.sort()
     for _, port, label, pid in proc_candidates:
         add_http(port, label, "process", pid)
+
+    # Passively discover active ports configured in ANY FlClash-family fork's shared_preferences.json
+    # (only if that port is genuinely listening right now — never adds dead/unstarted ports).
+    for fc_brand, fc_port, _fc_tun in discover_flclash_family_configs(is_mac=is_mac):
+        if fc_port in excluded or fc_port in seen_http_ports or fc_port in discovered_controller_ports:
+            continue
+        owning_pids = port_pids.get(fc_port)
+        if not owning_pids:
+            continue
+        owner_proc = processes.get(owning_pids[0], ("", 0))[0].casefold()
+        if owner_proc in _NON_PROXY_EXES:
+            continue
+        add_http(fc_port, fc_brand, "process", owning_pids[0])
 
     # Deduplicate controllers while preserving order
     deduped_controllers: list[Controller] = []

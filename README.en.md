@@ -68,10 +68,10 @@ Detailed setup guides (Chinese): [Windows Guide](使用说明.md) ｜ [macOS Gui
 
 - **4-Layer Universal Proxy & White-Label Client Detection**
   - Out-of-the-box support for 20+ clients: Clash Verge Rev, Clash Party / Mihomo Party, JImmm, FlClash, Clash Nyanpasu, Sparkle, ClashX, Stash, Surge, v2rayN, Hiddify, NekoBox / Throne, Karing, Shadowsocks, Xray, Sing-box, and more.
-  - **Directory Skeleton Fingerprinting + Native Brand Resolution**: Automatically identifies rebranded/white-label FlClash, Mihomo, Sing-box, and Xray forks without hardcoding brand lists, reading the real app name directly from Windows PE version metadata or macOS `Info.plist`.
-  - **Protocol-First Probing + Portless Pure-TUN Fallback**: Actively probes Clash REST API / HTTP CONNECT / SOCKS5 on local listeners and wildcard Windows Named Pipes / macOS Unix sockets; gracefully falls back to direct OS TUN validation when a proxy exposes no local HTTP port, and detects dead system-proxy ports or unstarted cores with clear diagnostics.
-- **Stable Local HTTP/CONNECT Proxy Relay (`127.0.0.1:17890`)**
-  - Toggle `⇄ 统一中继` to bind a pure-stdlib local relay ([relay.py](relay.py)) that keeps all launched apps connected to a single stable local port.
+  - **Directory Skeleton Fingerprinting + Universal GUI-Framework IPC Guard**: Automatically identifies rebranded/white-label FlClash, Mihomo, Sing-box, and Xray forks without brand lists (reading real display names from Windows PE metadata or macOS `Info.plist`), passively discovers FlClash-family `shared_preferences.json` ports, and detects Flutter/Electron/Tauri/Qt GUI frontends so ephemeral internal IPC sockets are never disrupted.
+  - **Auto SOCKS5→HTTP Bridging + Transparent Router / Custom-TUN Fallback**: Actively probes Clash REST API / HTTP CONNECT / SOCKS5 and wildcard Named Pipes / Unix sockets; **SOCKS5-only clients** (Shadowsocks, SSH `-D`, Tor, Xray/sing-box SOCKS inbounds) are automatically verified and bridged to local HTTP via pure-stdlib RFC 1928 relay; portless custom-named TUN VPNs and **router/gateway transparent proxies** are verified directly via non-CN AI-endpoint ground-truth probes.
+- **Stable Local HTTP/CONNECT Proxy Relay (`127.0.0.1:17890`, HTTP + SOCKS5 Upstreams)**
+  - Toggle `⇄ 统一中继` to bind a pure-stdlib local relay ([relay.py](relay.py)) supporting both HTTP and SOCKS5 local upstreams so all launched apps share one stable local port.
   - Isolated web-app windows share a persistent browser profile so switching proxy clients never logs you out; upstream proxies hot-swap per domain in the background with `350ms` dead-upstream failover and strict `HTTP 502` on upstream loss (zero direct traffic leaks).
 - **Per-Service Exit Node & True Region Detection**
   - Probes exit regions directly against AI domains (`chatgpt.com`, `claude.ai`) and extracts the exact matched outbound Clash node & RTT for each of the 12+ monitored AI endpoints, highlighting restricted regions and automatically avoiding them during selection and node repair.
@@ -96,7 +96,7 @@ python launcher.py --minimized
 # Headless CLI probe check (outputs JSON)
 python launcher.py --check
 
-# Run full unit test suite (72 tests)
+# Run full unit test suite (77 tests)
 python -B -m unittest -v
 ```
 
@@ -123,3 +123,4 @@ Pushing any `v*` tag (e.g., `git tag v2.3.0 && git push origin v2.3.0`) or trigg
 
 - All local relays and controller connections are strictly restricted to loopback (`127.0.0.1`), local Windows Named Pipes, or local Unix domain sockets—never binding `0.0.0.0` and never silently falling back to direct internet connections.
 - Controller bearer secrets live in memory for the current session only and are never written to disk; copied diagnostic reports strip secrets and personal file paths automatically.
+
