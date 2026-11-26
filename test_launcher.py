@@ -1379,6 +1379,151 @@ Active Routes:
             self.assertFalse(any(c.port == 18899 for c in dead_snap.http_proxies))
             self.assertTrue(any(c.port == 18899 and c.name == "任意自定义机场" for c in live_snap.http_proxies))
 
+    def test_rollback_restores_backups_created_files_winenv_autostart_and_runtime_state(self):
+        import envcheck
+        envcheck.clear_runtime_changes()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                home = root / "home"
+                data_dir = root / "data"
+                home.mkdir()
+                data_dir.mkdir()
+
+                # 1. Existing files modified by envcheck -> restore from .bak
+                gitconfig = home / ".gitconfig"
+                orig_git = "[http]\n\tproxy = http://127.0.0.1:9674\n"
+                gitconfig.write_text(orig_git, encoding="utf-8")
+                npmrc = home / ".npmrc"
+                orig_npm = "https-proxy=http://127.0.0.1:9674\n"
+                npmrc.write_text(orig_npm, encoding="utf-8")
+
+                conflicts = envcheck.audit_environment(
+                    [7897], 7897, home=home, codex_env=home / ".codex" / ".env",
+                    user_env={}, process_env={}, port_checker=lambda p: p == 7897,
+                )
+                for item in conflicts:
+                    envcheck.fix_conflict(item, data_dir=data_dir)
+                self.assertIn("7897", gitconfig.read_text(encoding="utf-8"))
+                self.assertIn("7897", npmrc.read_text(encoding="utf-8"))
+
+                # 2. Newly created .codex/.env (did not exist before) -> deleted on rollback
+                codex_env = home / ".codex" / ".env"
+                with patch.object(app, "codex_dotenv", return_value=codex_env), \
+                        patch.object(app, "DATA", data_dir):
+                    app.with_codex_proxy(7897, lambda: None)
+                self.assertTrue(codex_env.is_file())
+                self.assertFalse((codex_env.parent / ".env.ai-proxy-launcher.bak").exists())
+
+                # 3. Recorded Windows user env var (first-write-wins preserves original :9674)
+                envcheck.record_winenv_change(
+                    "HTTPS_PROXY", existed_before=True,
+                    previous_value="http://127.0.0.1:9674", new_value="http://127.0.0.1:7897",
+                    data_dir=data_dir,
+                )
+                envcheck.record_winenv_change(
+                    "HTTPS_PROXY", existed_before=True,
+                    previous_value="http://127.0.0.1:7897", new_value="http://127.0.0.1:17890",
+                    data_dir=data_dir,
+                )
+
+                # 4. Session runtime changes (first-write-wins for node & TUN)
+                ctrl = app.Controller(port=9090, name="Clash Verge Rev")
+                envcheck.record_runtime_node_change(ctrl, "OpenAI", "US-01", "JP-01")
+                envcheck.record_runtime_node_change(ctrl, "OpenAI", "JP-01", "SG-01")
+                envcheck.record_runtime_tun_change(ctrl, False, True)
+
+                items = envcheck.list_rollback_items(
+                    data_dir=data_dir, home=home, codex_env=codex_env,
+                    include_runtime=True, autostart_checker=lambda: True,
+                )
+                cats = {it.category for it in items}
+                self.assertEqual(cats, {"file", "winenv", "autostart", "runtime"})
+                self.assertEqual(len(items), 7)  # 3 files + 1 winenv + 1 autostart + 2 runtime
+
+                restored_env = {}
+                disabled_autostart = []
+                switched_nodes = []
+                toggled_tun = []
+
+                done, errors = envcheck.rollback_all_external(
+                    data_dir=data_dir, home=home, codex_env=codex_env,
+                    include_runtime=True,
+                    autostart_checker=lambda: True,
+                    autostart_disabler=lambda: disabled_autostart.append(True),
+                    winenv_writer=lambda k, v: restored_env.__setitem__(k, v),
+                    node_switcher=lambda ep, g, n: switched_nodes.append((ep.name, g, n)),
+                    tun_setter=lambda ep, en: toggled_tun.append((ep.name, en)),
+                )
+                self.assertEqual(errors, [])
+                self.assertEqual(len(done), 7)
+                self.assertEqual(gitconfig.read_text(encoding="utf-8"), orig_git)
+                self.assertEqual(npmrc.read_text(encoding="utf-8"), orig_npm)
+                self.assertFalse((home / ".gitconfig.ai-proxy-launcher.bak").exists())
+                self.assertFalse(codex_env.exists())
+                self.assertEqual(restored_env, {"HTTPS_PROXY": "http://127.0.0.1:9674"})
+                self.assertEqual(disabled_autostart, [True])
+                self.assertEqual(switched_nodes, [("Clash Verge Rev", "OpenAI", "US-01")])
+                self.assertEqual(toggled_tun, [("Clash Verge Rev", False)])
+
+                # After rollback, list_rollback_items is clean
+                remaining = envcheck.list_rollback_items(
+                    data_dir=data_dir, home=home, codex_env=codex_env,
+                    include_runtime=True, autostart_checker=lambda: False,
+                )
+                self.assertEqual(remaining, [])
+
+                # 5. Reset app own data (settings.json + optional Browser/)
+                (data_dir / "settings.json").write_text("{}", encoding="utf-8")
+                (data_dir / "Browser" / "edge-relay").mkdir(parents=True)
+                (data_dir / "Browser" / "edge-relay" / "Cookies").write_text("x", encoding="utf-8")
+                reset_msgs = envcheck.reset_app_data(data_dir, clear_browser=True)
+                self.assertEqual(len(reset_msgs), 2)
+                self.assertFalse((data_dir / "settings.json").exists())
+                self.assertFalse((data_dir / "Browser").exists())
+        finally:
+            envcheck.clear_runtime_changes()
+
+    def test_rollback_dialog_opens_and_reverts_items(self):
+        import tkinter as tk
+        import envcheck
+        import interface
+
+        envcheck.clear_runtime_changes()
+        with tempfile.TemporaryDirectory() as temp:
+            root_dir = Path(temp)
+            data_dir = root_dir / "data"
+            data_dir.mkdir()
+            sample = root_dir / ".npmrc"
+            sample.write_text("https-proxy=http://127.0.0.1:7897\n", encoding="utf-8")
+            bak = root_dir / ".npmrc.ai-proxy-launcher.bak"
+            bak.write_text("https-proxy=http://127.0.0.1:9674\n", encoding="utf-8")
+            envcheck.record_file_change(
+                sample, source="npm 配置 (.npmrc)", existed_before=True, backup_path=bak, data_dir=data_dir,
+            )
+
+            with patch.object(interface, "DATA", data_dir), \
+                    patch.object(interface, "system_proxy_port", return_value=None), \
+                    patch.object(interface, "detect_paths", return_value={}), \
+                    patch.object(interface, "detected_proxy_apps", return_value={}):
+                try:
+                    tk_root = tk.Tk()
+                except tk.TclError:
+                    self.skipTest("Tk display unavailable")
+                tk_root.withdraw()
+                try:
+                    win = interface.LauncherWindow(tk_root, enable_tray=False)
+                    self.assertTrue(hasattr(win, "rollback_button"))
+                    dlg = win.open_rollback()
+                    self.assertTrue(dlg.winfo_exists())
+                    dlg.undo_all_button._command()
+                    tk_root.update()
+                    self.assertEqual(sample.read_text(encoding="utf-8"), "https-proxy=http://127.0.0.1:9674\n")
+                    self.assertFalse(bak.exists())
+                    dlg.destroy()
+                finally:
+                    tk_root.destroy()
+
 
 if __name__ == "__main__":
     unittest.main()

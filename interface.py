@@ -300,6 +300,15 @@ class LauncherWindow:
             tooltip="打开使用说明书（随时可反复查阅与设置启动弹出偏好）",
         )
         self.guide_button.pack(side="right")
+        self.rollback_button = PillButton(
+            top_right_row, "↺ 撤销修改", self.open_rollback,
+            bg=p["hero_bg"], fill=p["hero_card"], hover_fill="#283548", fg="#CBD5E1",
+            outline=p["hero_border"], hover_outline=AMBER, font_spec=(FONT, 8, "bold"),
+            height=self.px(22), pad_x=self.px(10),
+            tooltip="查看并一键撤销本软件对外部配置文件、环境变量、开机自启及代理状态的修改",
+        )
+        self.rollback_button.pack(side="right", padx=(0, self.px(6)))
+        self._update_rollback_badge()
 
         btn_row = tk.Frame(right, bg=p["hero_bg"])
         btn_row.pack(anchor="e")
@@ -589,6 +598,56 @@ class LauncherWindow:
     def open_guide(self, *, startup_gate: bool = False, on_acknowledged=None) -> tk.Toplevel:
         return dialogs.open_user_guide(self, startup_gate=startup_gate, on_acknowledged=on_acknowledged)
 
+    def open_rollback(self) -> tk.Toplevel:
+        return dialogs.open_rollback_dialog(self)
+
+    def _update_rollback_badge(self) -> None:
+        if not hasattr(self, "rollback_button"):
+            return
+        try:
+            count = len(envcheck.list_rollback_items(data_dir=self.settings.parent, include_runtime=True))
+        except Exception:
+            count = 0
+        p = self.p
+        if count > 0:
+            self.rollback_button.set_text(f"↺ 撤销修改 ({count})")
+            self.rollback_button.set_palette(
+                fill="#451A03", hover_fill="#78350F", fg="#FDE68A",
+                outline="#D97706", hover_outline="#F59E0B",
+            )
+        else:
+            self.rollback_button.set_text("↺ 撤销修改")
+            self.rollback_button.set_palette(
+                fill=p["hero_card"], hover_fill="#283548", fg="#CBD5E1",
+                outline=p["hero_border"], hover_outline=AMBER,
+            )
+
+    def reset_software_state(self, *, clear_browser: bool = False) -> list[str]:
+        msgs: list[str] = []
+        if self.relay.running or self.relay_enabled:
+            self.relay_enabled = False
+            self._socks_bridge_active = False
+            self.relay.stop()
+            self._update_relay_button()
+            msgs.append("已停止统一本地中继")
+        msgs.extend(envcheck.reset_app_data(self.settings.parent, clear_browser=clear_browser))
+        self.provider = AUTO
+        self.clash_controller_port = None
+        self.clash_secret = ""
+        self.enabled_presets = []
+        self.hidden_targets = set()
+        self.custom_targets = {}
+        self.skip_guide_on_start = False
+        self.auto.set(False)
+        self.minimize_to_tray.set(False)
+        self.targets = build_active_targets(self.custom_targets, self.enabled_presets, self.hidden_targets)
+        if hasattr(self, "provider_choice"):
+            self.provider_choice.set(AUTO)
+            self.update_proxy_controls()
+        for msg in msgs:
+            self.write(f"重置软件数据 · {msg}", "good")
+        return msgs
+
     def start_background_tasks(self) -> None:
         """Start periodic live-route polling and initial proxy check/auto-launch once ready."""
         if self._startup_started:
@@ -833,6 +892,7 @@ class LauncherWindow:
             ).pack(side="left", padx=(0, self.px(6)))
 
     def _update_env_badge(self) -> None:
+        self._update_rollback_badge()
         issues = len(self.last_conflicts) + sum(1 for h in self.last_health if h.status in {"warn", "error"})
         if issues > 0:
             self.env_button.set_text(f"环境体检 ({issues})")

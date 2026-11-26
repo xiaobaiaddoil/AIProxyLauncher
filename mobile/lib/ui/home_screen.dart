@@ -10,6 +10,7 @@ import '../services/network_audit.dart';
 import '../services/platform_bridge.dart';
 import '../services/proxy_engine.dart';
 import '../services/region_utils.dart';
+import '../services/rollback_service.dart';
 import '../services/settings_store.dart';
 import 'sheets.dart';
 import 'theme.dart';
@@ -50,6 +51,7 @@ class _HomeScreenState extends State<HomeScreen> {
   DiscoveryResult? _lastResult;
   List<HealthFinding> _lastFindings = const [];
   final List<(String, String)> _logs = [];
+  final MobileRollbackService _rollbackService = MobileRollbackService();
 
   AppPalette get _p => widget.settings.darkMode
       ? AppPalette.darkPalette
@@ -221,6 +223,7 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       final findings = await widget.auditService.diagnoseNetworkHealth(
         networkState: result.networkState,
+        reports: result.reports,
       );
       await _syncRelayRoutes(result.reports);
       if (!mounted) return;
@@ -282,6 +285,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Future<void> _openTarget(AiTarget target) async {
     final ok = await widget.bridge.launchApp(
       androidPackage: target.androidPackage.isNotEmpty ? target.androidPackage : null,
+      fallbackAndroidPackages: target.fallbackAndroidPackages,
       iosScheme: target.iosScheme.isNotEmpty ? target.iosScheme : null,
       url: target.webUrl,
     );
@@ -373,19 +377,123 @@ class _HomeScreenState extends State<HomeScreen> {
       palette: _p,
       endpoint: ep,
       clashApi: widget.engine.clashApi,
-      onSwitched: () => unawaited(_runCheck()),
+      rollbackService: _rollbackService,
+      onSwitched: () {
+        if (mounted) setState(() {});
+        unawaited(_runCheck());
+      },
+    );
+  }
+
+  Future<void> _openGeminiAclSheet() async {
+    var netState = _lastResult?.networkState ?? await widget.bridge.getNetworkState();
+    if (netState.platform == 'android' && netState.geminiPackages.isEmpty) {
+      final audited = await widget.bridge.inspectPackages(geminiSuiteSpecs);
+      if (audited.isNotEmpty) {
+        netState = netState.copyWith(geminiPackages: audited);
+      }
+    }
+    if (!mounted) return;
+    final aclReport = widget.auditService.analyzeGeminiAccessControl(
+      networkState: netState,
+      reports: _lastResult?.reports ?? const [],
+    );
+    await showGeminiAccessControlSheet(
+      context: context,
+      palette: _p,
+      report: aclReport,
+      onAutoPatchClash: () async {
+        final ep = aclReport.fixableEndpoint;
+        if (ep == null) return false;
+        final prev = List<String>.from(aclReport.currentClashIncludePackages);
+        final merged = <String>{
+          ...prev,
+          ...aclReport.recommendedPackages,
+        }.toList();
+        final ok = await widget.engine.clashApi.patchTunIncludePackages(ep, merged);
+        if (ok) {
+          _rollbackService.recordTunIncludePackageChange(
+            endpoint: ep,
+            previousPackages: prev,
+            newPackages: merged,
+          );
+          if (mounted) {
+            _appendLog(
+              '已通过 ${ep.name} 控制接口补全 Gemini 访问控制白名单（支持撤销）。',
+              level: 'good',
+            );
+            unawaited(_runCheck());
+          }
+        }
+        return ok;
+      },
+      onOpenProxyApp: () => unawaited(_openProxyAppChooser()),
+      onOpenGeminiWeb: () async {
+        final ok = await widget.bridge.openUrl('https://gemini.google.com/app');
+        if (mounted) {
+          _appendLog(
+            ok ? '已通过浏览器直达 Gemini 网页版' : '无法打开外部浏览器访问 Gemini 网页版',
+            level: ok ? 'good' : 'error',
+          );
+        }
+      },
+    );
+  }
+
+  Future<void> _openRollbackSheet() async {
+    await showMobileRollbackSheet(
+      context: context,
+      palette: _p,
+      rollbackService: _rollbackService,
+      clashApi: widget.engine.clashApi,
+      relayRunning: widget.relay.running,
+      relayPort: widget.relay.port,
+      onStopRelay: () async {
+        await widget.relay.stop();
+        if (mounted) {
+          setState(() => _socksBridgeActive = false);
+        }
+        if (widget.settings.relayEnabled) {
+          widget.onSettingsChanged(widget.settings.copyWith(relayEnabled: false));
+        }
+        _appendLog('已停止统一本地中继。', level: 'good');
+      },
+      onResetSettings: () async {
+        _controllerSecret = '';
+        await widget.relay.stop();
+        if (mounted) {
+          setState(() => _socksBridgeActive = false);
+        }
+        widget.onSettingsChanged(
+          AppSettings(
+            darkMode: widget.settings.darkMode,
+            guideDismissed: true,
+          ),
+        );
+        _appendLog('已恢复软件默认设置并清除内存密钥。', level: 'good');
+      },
+      onChanged: () {
+        if (mounted) {
+          setState(() {});
+          unawaited(_runCheck());
+        }
+      },
     );
   }
 
   Future<void> _openAuditSheet() async {
     final netState = _lastResult?.networkState ?? await widget.bridge.getNetworkState();
+    final reports = _lastResult?.reports ?? const <ProxyReport>[];
     final findings = _lastFindings.isNotEmpty
         ? _lastFindings
-        : await widget.auditService.diagnoseNetworkHealth(networkState: netState);
+        : await widget.auditService.diagnoseNetworkHealth(
+            networkState: netState,
+            reports: reports,
+          );
     if (!mounted) return;
     final reportText = widget.auditService.buildDiagnosticReport(
       networkState: netState,
-      reports: _lastResult?.reports ?? const [],
+      reports: reports,
       detectedProxyApps: _lastResult?.detectedProxyApps ?? const [],
       findings: findings,
       proxyMode: widget.settings.proxyMode,
@@ -396,6 +504,8 @@ class _HomeScreenState extends State<HomeScreen> {
       palette: _p,
       findings: findings,
       diagnosticReport: reportText,
+      onOpenGeminiAcl: netState.platform == 'ios' ? null : () => unawaited(_openGeminiAclSheet()),
+      onOpenRollback: () => unawaited(_openRollbackSheet()),
     );
   }
 
@@ -461,6 +571,7 @@ class _HomeScreenState extends State<HomeScreen> {
               ),
             ),
             SliverToBoxAdapter(child: _buildQuickActions(reports)),
+            SliverToBoxAdapter(child: _buildAccessControlBanner(reports)),
             SliverToBoxAdapter(child: _buildCategoryBar()),
             SliverPadding(
               padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -545,6 +656,15 @@ class _HomeScreenState extends State<HomeScreen> {
                                 ),
                               ),
                             ),
+                            _heroIconBtn(
+                              icon: Icons.history_rounded,
+                              tooltip: _rollbackService.hasChanges
+                                  ? '撤销修改 (${_rollbackService.count})'
+                                  : '撤销修改',
+                              highlight: _rollbackService.hasChanges,
+                              onTap: _openRollbackSheet,
+                            ),
+                            const SizedBox(width: 6),
                             _heroIconBtn(
                               icon: Icons.help_outline_rounded,
                               tooltip: '使用说明',
@@ -632,6 +752,7 @@ class _HomeScreenState extends State<HomeScreen> {
     required IconData icon,
     required String tooltip,
     required VoidCallback onTap,
+    bool highlight = false,
   }) {
     return Tooltip(
       message: tooltip,
@@ -641,11 +762,17 @@ class _HomeScreenState extends State<HomeScreen> {
         child: Container(
           padding: const EdgeInsets.all(6),
           decoration: BoxDecoration(
-            color: _p.heroCard,
+            color: highlight ? const Color(0xFF451A03) : _p.heroCard,
             borderRadius: BorderRadius.circular(10),
-            border: Border.all(color: _p.heroBorder),
+            border: Border.all(
+              color: highlight ? AppPalette.amber : _p.heroBorder,
+            ),
           ),
-          child: Icon(icon, size: 17, color: _p.heroText),
+          child: Icon(
+            icon,
+            size: 17,
+            color: highlight ? const Color(0xFFFDE68A) : _p.heroText,
+          ),
         ),
       ),
     );
@@ -928,6 +1055,52 @@ class _HomeScreenState extends State<HomeScreen> {
     );
   }
 
+  Widget _buildAccessControlBanner(List<ProxyReport> reports) {
+    final netState = _lastResult?.networkState;
+    if (netState == null || netState.platform != 'android') {
+      return const SizedBox.shrink();
+    }
+    final acl = widget.auditService.analyzeGeminiAccessControl(
+      networkState: netState,
+      reports: reports,
+    );
+    if (acl.severity != 'error') {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(14, 8, 14, 0),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(14),
+        onTap: _openGeminiAclSheet,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+          decoration: BoxDecoration(
+            color: _p.amberPale,
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(color: AppPalette.amber),
+          ),
+          child: Row(
+            children: [
+              Icon(Icons.shield_outlined, size: 18, color: _p.amberInk),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  '${acl.headline} · 点此查看 Gemini 访问控制修复方案',
+                  style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: _p.amberInk,
+                  ),
+                ),
+              ),
+              Icon(Icons.chevron_right_rounded, size: 18, color: _p.amberInk),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   Widget _buildCategoryBar() {
     final cats = [
       ('all', '全部 (${_allTargets.length})'),
@@ -1181,6 +1354,27 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
               ),
               const Spacer(),
+              if (target.id == 'gemini_app' &&
+                  _lastResult?.networkState.platform != 'ios') ...[
+                OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+                    minimumSize: Size.zero,
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    side: const BorderSide(color: AppPalette.amber),
+                    foregroundColor: _p.amberInk,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                  ),
+                  onPressed: _openGeminiAclSheet,
+                  child: const Text(
+                    '访问控制修复',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.w700),
+                  ),
+                ),
+                const SizedBox(width: 6),
+              ],
               FilledButton.tonalIcon(
                 style: FilledButton.styleFrom(
                   backgroundColor: AppPalette.teal,
