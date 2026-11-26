@@ -176,3 +176,77 @@ class MacOSTests(unittest.TestCase):
             with patch.object(macos.subprocess, "Popen") as start:
                 macos.launch(launcher.TARGETS["chatgpt"], brave, 17890, root, False, stable_profile=True)
             self.assertIn(f"--user-data-dir={root / 'Browser' / 'Brave Browser-relay'}", start.call_args.args[0])
+
+    def test_create_ssl_context_falls_back_to_system_ca_bundle_and_keychain(self):
+        import proxies
+        import sys
+
+        class FakeCtx:
+            def __init__(self, count: int, tag: str):
+                self._count = count
+                self.tag = tag
+
+            def cert_store_stats(self):
+                return {"x509_ca": self._count}
+
+        # 1. Empty default trust store -> loads /etc/ssl/cert.pem via cafile
+        def fake_create(cafile=None, cadata=None):
+            if cafile == "/etc/ssl/cert.pem":
+                return FakeCtx(150, "file")
+            return FakeCtx(0, "empty")
+
+        with patch.object(proxies, "_SSL_CA_SOURCE", None), \
+                patch.object(proxies.ssl, "create_default_context", side_effect=fake_create), \
+                patch.object(proxies.os.path, "isfile", side_effect=lambda p: p == "/etc/ssl/cert.pem"):
+            ctx = proxies.create_ssl_context()
+            self.assertEqual(ctx.tag, "file")
+
+        # 2. No CA file on disk on macOS -> falls back to SystemRootCertificates.keychain
+        def fake_create_keychain(cafile=None, cadata=None):
+            if cadata and "BEGIN CERTIFICATE" in cadata:
+                return FakeCtx(120, "keychain")
+            return FakeCtx(0, "empty")
+
+        with patch.object(proxies, "_SSL_CA_SOURCE", None), \
+                patch.object(proxies, "sys", type("S", (), {"platform": "darwin"})()), \
+                patch.object(proxies.ssl, "create_default_context", side_effect=fake_create_keychain), \
+                patch.object(proxies.os.path, "isfile", return_value=False), \
+                patch.object(proxies.subprocess, "check_output", return_value="-----BEGIN CERTIFICATE-----\nFAKE\n-----END CERTIFICATE-----\n"):
+            ctx = proxies.create_ssl_context()
+            self.assertEqual(ctx.tag, "keychain")
+
+        # 3. Live verification on macOS CI runner: real context & Apple system CA bundle both load >= 10 CAs
+        if sys.platform == "darwin":
+            import ssl
+            proxies._SSL_CA_SOURCE = None
+            real_ctx = proxies.create_ssl_context()
+            self.assertGreaterEqual(real_ctx.cert_store_stats().get("x509_ca", 0), 10)
+            self.assertTrue(proxies.os.path.isfile("/etc/ssl/cert.pem"))
+            apple_ctx = ssl.create_default_context(cafile="/etc/ssl/cert.pem")
+            self.assertGreaterEqual(apple_ctx.cert_store_stats().get("x509_ca", 0), 10)
+
+    def test_macos_jimmm_socket_labeling_and_root_tun_port_attribution(self):
+        import proxies
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.bundle(root, "Jimmm", "Jimmm")
+            with patch.object(macos, "APPLICATIONS", (root,)):
+                self.assertEqual(macos.party_socket_label(), "JImmm")
+                socks = macos.sockets()
+                self.assertTrue(any(label == "JImmm" and path.name == "mihomo-party.sock" for label, path in socks))
+                self.assertTrue(any(label == "JImmm" and path.name == "jimmm.sock" for label, path in socks))
+
+        # Root-owned TUN core hidden from non-root lsof: system proxy :9674 resolves to JImmm when Jimmm is running
+        snap = proxies.discover_proxies(
+            processes={101: ("Jimmm", 1), 102: ("mihomo", 101)},
+            listeners=[],
+            sys_port=9674,
+            env_ports=[],
+            static_controllers=[],
+            is_mac=True,
+            detected_apps={"JImmm": Path("/Applications/Jimmm.app")},
+        )
+        self.assertEqual(len(snap.http_proxies), 1)
+        self.assertEqual(snap.http_proxies[0].name, "JImmm")
+        self.assertEqual(snap.http_proxies[0].port, 9674)

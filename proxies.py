@@ -692,6 +692,70 @@ def infer_region_from_node(node_name: str) -> str:
     return ""
 
 
+_SSL_CA_SOURCE: tuple[str, str] | None = None
+MAC_CA_BUNDLE_CANDIDATES: tuple[str, ...] = (
+    "/etc/ssl/cert.pem",
+    "/private/etc/ssl/cert.pem",
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/opt/homebrew/etc/openssl@3/cert.pem",
+    "/usr/local/etc/openssl@3/cert.pem",
+)
+
+
+def _detect_ca_source() -> tuple[str, str]:
+    """Locate a working system CA bundle when Python's default OpenSSL trust store is empty (e.g. macOS .app)."""
+    global _SSL_CA_SOURCE
+    if _SSL_CA_SOURCE is not None:
+        return _SSL_CA_SOURCE
+    try:
+        ctx = ssl.create_default_context()
+        ca_count = ctx.cert_store_stats().get("x509_ca", 0)
+        if not isinstance(ca_count, int):
+            return ("default", "")
+        if ca_count >= 10:
+            _SSL_CA_SOURCE = ("default", "")
+            return _SSL_CA_SOURCE
+    except (OSError, ssl.SSLError):
+        pass
+    for path in MAC_CA_BUNDLE_CANDIDATES:
+        if os.path.isfile(path):
+            try:
+                test = ssl.create_default_context(cafile=path)
+                if test.cert_store_stats().get("x509_ca", 0) >= 10:
+                    _SSL_CA_SOURCE = ("file", path)
+                    return _SSL_CA_SOURCE
+            except (OSError, ssl.SSLError):
+                continue
+    if sys.platform == "darwin":
+        try:
+            pem = subprocess.check_output(
+                [
+                    "/usr/bin/security", "find-certificate", "-a", "-p",
+                    "/System/Library/Keychains/SystemRootCertificates.keychain",
+                ],
+                text=True, timeout=5, stderr=subprocess.DEVNULL,
+            )
+            if "BEGIN CERTIFICATE" in pem:
+                test = ssl.create_default_context(cadata=pem)
+                if test.cert_store_stats().get("x509_ca", 0) > 0:
+                    _SSL_CA_SOURCE = ("cadata", pem)
+                    return _SSL_CA_SOURCE
+        except (OSError, subprocess.SubprocessError, ssl.SSLError):
+            pass
+    _SSL_CA_SOURCE = ("default", "")
+    return _SSL_CA_SOURCE
+
+
+def create_ssl_context() -> ssl.SSLContext:
+    """Create a verified TLS context that works out-of-the-box in PyInstaller macOS .app bundles."""
+    kind, value = _detect_ca_source()
+    if kind == "file":
+        return ssl.create_default_context(cafile=value)
+    if kind == "cadata":
+        return ssl.create_default_context(cadata=value)
+    return ssl.create_default_context()
+
+
 def probe_exit_region(port: int, timeout: float = 3.5, host: str = "www.cloudflare.com") -> tuple[str, int | None]:
     """Read proxy exit country code and RTT (ms) via Cloudflare trace through local HTTP CONNECT."""
     started = time.perf_counter()
@@ -708,7 +772,7 @@ def probe_exit_region(port: int, timeout: float = 3.5, host: str = "www.cloudfla
                     break
         if len(status) < 2 or status[1] != b"200":
             return "", None
-        context = ssl.create_default_context()
+        context = create_ssl_context()
         with context.wrap_socket(sock, server_hostname=host) as tls:
             tls.sendall(
                 f"GET /cdn-cgi/trace HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nUser-Agent: AIProxyLauncher\r\n\r\n".encode("ascii")
@@ -1144,14 +1208,31 @@ def discover_proxies(
         if name not in {"系统代理", "环境变量代理"}:
             apps.setdefault(name, None)
 
+    running_proxy_names: set[str] = set()
+    for pid in processes:
+        ident = identify_process_proxy(pid, processes)
+        if ident:
+            running_proxy_names.add(ident)
+
+    def infer_port_label(port: int, owning_pid: int | None, fallback: str) -> str:
+        if owning_pid:
+            return fallback_process_label(owning_pid, processes, fallback)
+        # When TUN core runs as root on macOS, non-root lsof cannot see its listening PID;
+        # match against running proxy profiles' well-known default ports first.
+        for name in running_proxy_names:
+            profile = PROFILE_BY_NAME.get(name)
+            if profile and port in profile.default_ports:
+                return name
+        return fallback
+
     if sys_port:
         owning_pid = port_pids.get(sys_port, [None])[0]
-        label = fallback_process_label(owning_pid, processes, "系统代理") if owning_pid else "系统代理"
+        label = infer_port_label(sys_port, owning_pid, "系统代理")
         add_http(sys_port, label, "system", owning_pid)
 
     for port in env_ports:
         owning_pid = port_pids.get(port, [None])[0]
-        label = fallback_process_label(owning_pid, processes, "环境变量代理") if owning_pid else "环境变量代理"
+        label = infer_port_label(port, owning_pid, "环境变量代理")
         add_http(port, label, "env", owning_pid)
 
     # Sort process listening ports so known default ports come before arbitrary internal ports

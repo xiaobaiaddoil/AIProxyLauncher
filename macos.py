@@ -15,7 +15,7 @@ SUPPORT = HOME / "Library/Application Support"
 APPLICATIONS = (Path("/Applications"), HOME / "Applications")
 DATA = SUPPORT / "AIProxyLauncher"
 VERGE = "io.github.clash-verge-rev.clash-verge-rev"
-PARTY_NAMES = ("Jimmm", "JImmm", "Clash Party", "Mihomo Party", "clash-party", "mihomo-party",
+PARTY_NAMES = ("Jimmm", "JImmm", "jimmm", "Clash Party", "Mihomo Party", "clash-party", "mihomo-party",
                "mihomo-party-org.mihomo-party")
 BROWSERS = ("Google Chrome", "Microsoft Edge", "Brave Browser", "Arc", "Vivaldi", "Chromium")
 APP_NAMES = {
@@ -111,7 +111,7 @@ def config_files() -> list[tuple[str, Path]]:
         ("Clash Verge Rev", clash / "clash-verge.yaml"),
         ("Clash Nyanpasu", SUPPORT / "clash-nyanpasu/clash-config.yaml"),
         *((label, root / "config.yaml") for label, root in roots),
-        *(("JImmm" if name in {"Jimmm", "JImmm"} else "Clash Party", SUPPORT / name / filename)
+        *(("JImmm" if name.casefold() == "jimmm" else "Clash Party", SUPPORT / name / filename)
           for name in PARTY_NAMES for filename in ("mihomo.yaml", "work/config.yaml", "config.yaml")),
         ("Sparkle", SUPPORT / "sparkle/mihomo.yaml"),
         ("Sparkle", SUPPORT / "sparkle/work/config.yaml"),
@@ -126,10 +126,18 @@ def proxy_apps() -> dict[str, Path]:
     return {key: bundle for key, group in MAC_PROXY_BUNDLES.items() if (bundle := find_bundle(*group))}
 
 
+def party_socket_label() -> str:
+    """Return 'JImmm' when JImmm is installed without Clash Party, else 'Clash Party'."""
+    if find_bundle("Jimmm", "JImmm") and not find_bundle("Clash Party", "Mihomo Party"):
+        return "JImmm"
+    return "Clash Party"
+
+
 def sockets() -> list[tuple[str, Path]]:
     tmp = Path("/tmp")
     roots = [tmp, Path(tempfile.gettempdir())]
     uid = str(os.getuid()) if hasattr(os, "getuid") else ""
+    party_label = party_socket_label()
     paths = [
         ("Clash Verge Rev", tmp / "verge/verge-mihomo.sock"),
         ("Clash Verge Rev", tmp / "verge/verge-mihomo-alpha.sock"),
@@ -137,28 +145,34 @@ def sockets() -> list[tuple[str, Path]]:
         ("Clash Nyanpasu", tmp / "clash-nyanpasu/mihomo.sock"),
     ]
     for root in dict.fromkeys(roots):
-        paths.extend(("Clash Party", root / name) for name in (
+        paths.extend(("JImmm", root / name) for name in (
+            "jimmm.sock", "Jimmm.sock", "jimmm/mihomo.sock", "Jimmm/mihomo.sock",
+        ))
+        paths.extend((party_label, root / name) for name in (
             "mihomo.sock", "mihomo-party.sock", "mihomo-party/mihomo.sock",
             "clash-party.sock", "clash-party/mihomo.sock",
         ))
         paths.extend(("Sparkle", root / name) for name in ("sparkle.sock", "sparkle/mihomo.sock"))
         if uid:
-            paths.extend(("Clash Party", path) for path in sorted(root.glob(f"mihomo-party-{uid}-*.sock"))[:12])
-            paths.extend(("Clash Party", path) for path in sorted(root.glob(f"clash-party-{uid}-*.sock"))[:12])
+            paths.extend((party_label, path) for path in sorted(root.glob(f"mihomo-party-{uid}-*.sock"))[:12])
+            paths.extend((party_label, path) for path in sorted(root.glob(f"clash-party-{uid}-*.sock"))[:12])
         for pattern, label in (
             ("verge/*.sock", "Clash Verge Rev"),
             ("nyanpasu*.sock", "Clash Nyanpasu"),
             ("sparkle*.sock", "Sparkle"),
             ("flclash*.sock", "FlClash"),
+            ("jimmm*.sock", "JImmm"),
+            ("Jimmm*.sock", "JImmm"),
+            ("mihomo*.sock", party_label),
         ):
             try:
                 paths.extend((label, path) for path in sorted(root.glob(pattern))[:8])
             except OSError:
                 pass
-    paths.extend(
-        ("JImmm" if name in {"Jimmm", "JImmm"} else "Clash Party", SUPPORT / name / "mihomo.sock")
-        for name in PARTY_NAMES
-    )
+    for name in PARTY_NAMES:
+        label = "JImmm" if name.casefold() == "jimmm" else "Clash Party"
+        paths.append((label, SUPPORT / name / "mihomo.sock"))
+        paths.append((label, SUPPORT / name / "work/mihomo.sock"))
     return list(dict.fromkeys(paths))
 
 

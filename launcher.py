@@ -795,7 +795,7 @@ def connect_probe(service: str, port: int | None, timeout: float = 8, endpoint: 
     with connection:
         source_port = connection.getsockname()[1]
         try:
-            context = ssl.create_default_context()
+            context = proxies.create_ssl_context()
             with context.wrap_socket(connection, server_hostname=host) as tls:
                 route = "unknown"
                 node = ""

@@ -4,8 +4,8 @@
 
 ## 启动
 
-1. 从 [Python 官网](https://www.python.org/downloads/macos/) 安装带 Tk 的 Python 3.11 或更新版本。首次安装 Python.org 的版本后，在「应用程序 → Python」中运行 `Install Certificates.command`，以便启动器验证 HTTPS 证书。
-2. 解压源码启动包，在 Mac 上双击 **macos-start.command**，或在解压目录执行 `bash macos-start.command`。
+1. 若下载独立应用包 `AIProxyLauncher-macOS-arm64.zip`，解压后直接双击 `AIProxyLauncher.app` 即可运行（已内置自动加载 macOS 系统根证书，无需额外安装 Python 或手动装证书）。
+2. 若使用源码启动包，需安装带 Tk 的 Python 3.11 或更新版本，解压后双击 **macos-start.command**，或在解压目录执行 `bash macos-start.command`。
 3. 打开代理软件并连上节点。保持「自动检测」，点击卡片勾选应用并点「检查修复并打开」。也可在下拉框选择 **手动指定端口** 填写本机 HTTP 端口。
 
 常规应用从 `/Applications` 和 `~/Applications` 查找；网页独立窗口支持 Chrome、Edge、Brave、Arc、Vivaldi、Chromium 等浏览器。点击「+ 管理应用」可开启 Cursor、Windsurf、VS Code、Gemini CLI、Codex CLI、Grok、Perplexity 或添加自定义应用/网页。
