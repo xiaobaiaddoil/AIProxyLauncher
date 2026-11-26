@@ -78,7 +78,7 @@ class NetworkAuditService {
             '当前配置了 Wi-Fi 代理 ${networkState.httpProxyHost}:${networkState.httpProxyPort}；部分原生 App 可能忽略 Wi-Fi 代理，建议开启代理软件的 VPN 模式。',
       ));
     } else {
-      findings.add(HealthFinding(
+      findings.add(const HealthFinding(
         category: 'VPN',
         status: 'warn',
         title: '未检测到本机 VPN 网卡',
@@ -116,7 +116,7 @@ class NetworkAuditService {
         detail: 'AI 域名已由代理 Fake-IP 接管（示例 ${fakeIps.first}），可有效防止移动网络 DNS 污染。',
       ));
     } else if (allIps.isEmpty) {
-      findings.add(HealthFinding(
+      findings.add(const HealthFinding(
         category: 'DNS',
         status: 'warn',
         title: '系统 DNS 暂时无法解析 AI 域名',
@@ -143,7 +143,7 @@ class NetworkAuditService {
           detail: '当前解析为真实 IP（如 ${firstIps.first}）；若 App 加载缓慢或超时，建议开启 Fake-IP。',
         ));
       } else {
-        findings.add(HealthFinding(
+        findings.add(const HealthFinding(
           category: 'DNS',
           status: 'ok',
           title: '系统 DNS 解析可用',
@@ -165,7 +165,7 @@ class NetworkAuditService {
             '当前移动网络/Wi-Fi 存在公网 IPv6（$masked）。若 AI App 在 VPN 下卡顿或地区漂移，请在代理软件开启 IPv6 接管或关闭 IPv6 路由。',
       ));
     } else {
-      findings.add(HealthFinding(
+      findings.add(const HealthFinding(
         category: 'IPv6',
         status: 'ok',
         title: '无公网 IPv6 泄漏风险',
@@ -236,3 +236,4 @@ class NetworkAuditService {
     return buf.toString().trimRight();
   }
 }
+

@@ -5,7 +5,6 @@ import 'package:ai_proxy_launcher/models/models.dart';
 import 'package:ai_proxy_launcher/services/platform_bridge.dart';
 import 'package:ai_proxy_launcher/services/proxy_engine.dart';
 import 'package:ai_proxy_launcher/services/settings_store.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 class _TestBridge implements PlatformBridge {
@@ -103,3 +102,4 @@ void main() {
     expect(find.text('AI 代理启动器'), findsOneWidget);
   });
 }
+

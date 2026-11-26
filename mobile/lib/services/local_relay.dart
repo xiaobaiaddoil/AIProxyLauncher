@@ -123,7 +123,7 @@ class _SocketReader {
 }
 
 class Socks5Connection {
-  Socks5Connection(this.socket, this._reader);
+  Socks5Connection._(this.socket, this._reader);
 
   final Socket socket;
   final _SocketReader _reader;
@@ -187,7 +187,7 @@ Future<Socks5Connection> dialSocks5Upstream(
     } else {
       throw const SocketException('Unsupported SOCKS5 address type');
     }
-    return Socks5Connection(socket, reader);
+    return Socks5Connection._(socket, reader);
   } catch (_) {
     await reader.cancel();
     socket.destroy();
@@ -520,3 +520,4 @@ class LocalProxyRelay {
     } catch (_) {}
   }
 }
+

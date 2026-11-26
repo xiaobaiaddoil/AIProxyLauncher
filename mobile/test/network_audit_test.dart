@@ -99,3 +99,4 @@ void main() {
     expect(text, isNot(contains('SUPER_SECRET_DO_NOT_LEAK')));
   });
 }
+

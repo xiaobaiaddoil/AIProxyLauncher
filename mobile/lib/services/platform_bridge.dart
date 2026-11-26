@@ -137,3 +137,4 @@ class MethodChannelPlatformBridge implements PlatformBridge {
     return Platform.operatingSystem;
   }
 }
+

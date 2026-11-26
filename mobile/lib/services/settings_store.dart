@@ -48,3 +48,4 @@ class SettingsStore {
     } catch (_) {}
   }
 }
+

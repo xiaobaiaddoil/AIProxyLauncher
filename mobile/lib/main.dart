@@ -1,5 +1,6 @@
 import 'dart:async';
 
+// ignore: deprecated_member_use
 import 'package:flutter/material.dart';
 
 import 'models/models.dart';
@@ -100,3 +101,4 @@ class _AiProxyLauncherAppState extends State<AiProxyLauncherApp> {
     );
   }
 }
+

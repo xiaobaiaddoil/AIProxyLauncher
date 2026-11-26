@@ -623,3 +623,4 @@ const List<MobileProxyApp> knownMobileProxyApps = [
     androidPackage: 'com.wireguard.android',
   ),
 ];
+

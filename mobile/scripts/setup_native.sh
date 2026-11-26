@@ -38,3 +38,4 @@ if [ -f "ios/Runner.xcodeproj/project.pbxproj" ]; then
 fi
 
 echo "==> Platform scaffolding ready."
+
