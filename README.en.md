@@ -59,6 +59,8 @@ Download prebuilt standalone binaries directly from **[GitHub Releases (Latest)]
 | **Windows (x64)** | `AIProxyLauncher.exe` | Single-file portable executable; double-click to run, no Python required |
 | **macOS (Apple Silicon)** | `AIProxyLauncher-macOS-arm64.zip` | Unzip and launch `AIProxyLauncher.app` (auto-loads macOS system root CAs) |
 | **macOS (Universal Source)** | `AIProxyLauncher-macOS-Source.zip` | Works on both Intel & Apple Silicon Macs with Python 3.11+ (Tk); double-click `macos-start.command` |
+| **Android (Mobile)** | `AIProxyLauncher-Android.apk` | Standalone native Flutter APK; sideload directly (see [mobile/README.md](mobile/README.md)) |
+| **iOS (Mobile)** | `AIProxyLauncher-iOS-unsigned.ipa` / `XcodeProject.zip` | Ready for TrollStore / AltStore / sideloading or Xcode signing (see [mobile/README.md](mobile/README.md)) |
 
 Detailed setup guides (Chinese): [Windows Guide](使用说明.md) ｜ [macOS Guide](macOS使用说明.md)
 
