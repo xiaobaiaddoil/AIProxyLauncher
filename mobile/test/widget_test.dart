@@ -42,13 +42,21 @@ class _TestBridge implements PlatformBridge {
 void main() {
   testWidgets('HomeScreen renders hero header, AI cards, and settings persistence',
       (WidgetTester tester) async {
-    final tmpDir = await Directory.systemTemp.createTemp('ai_proxy_mobile_test');
-    addTearDown(() => tmpDir.delete(recursive: true));
-
     final bridge = _TestBridge();
-    final store = SettingsStore(bridge, overrideDir: tmpDir);
-    await store.save(const AppSettings(darkMode: true, guideDismissed: true));
-    final loaded = await store.load();
+    late SettingsStore store;
+    late AppSettings loaded;
+    Directory? tmpDir;
+    await tester.runAsync(() async {
+      tmpDir = await Directory.systemTemp.createTemp('ai_proxy_mobile_test');
+      store = SettingsStore(bridge, overrideDir: tmpDir);
+      await store.save(const AppSettings(darkMode: true, guideDismissed: true));
+      loaded = await store.load();
+    });
+    addTearDown(() async {
+      if (tmpDir != null && tmpDir!.existsSync()) {
+        tmpDir!.deleteSync(recursive: true);
+      }
+    });
     expect(loaded.guideDismissed, isTrue);
 
     final engine = MobileProxyEngine(
@@ -85,6 +93,7 @@ void main() {
         bridgeOverride: bridge,
         engineOverride: engine,
         settingsStoreOverride: store,
+        initialSettings: loaded,
         autoRunOnInit: false,
       ),
     );

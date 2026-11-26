@@ -23,12 +23,14 @@ class AiProxyLauncherApp extends StatefulWidget {
     this.bridgeOverride,
     this.engineOverride,
     this.settingsStoreOverride,
+    this.initialSettings,
     this.autoRunOnInit = true,
   });
 
   final PlatformBridge? bridgeOverride;
   final MobileProxyEngine? engineOverride;
   final SettingsStore? settingsStoreOverride;
+  final AppSettings? initialSettings;
   final bool autoRunOnInit;
 
   @override
@@ -41,8 +43,8 @@ class _AiProxyLauncherAppState extends State<AiProxyLauncherApp> {
   late final SettingsStore _store;
   final NetworkAuditService _audit = const NetworkAuditService();
   final LocalProxyRelay _relay = LocalProxyRelay();
-  AppSettings _settings = const AppSettings();
-  bool _loaded = false;
+  late AppSettings _settings;
+  late bool _loaded;
 
   @override
   void initState() {
@@ -50,7 +52,14 @@ class _AiProxyLauncherAppState extends State<AiProxyLauncherApp> {
     _bridge = widget.bridgeOverride ?? MethodChannelPlatformBridge();
     _engine = widget.engineOverride ?? MobileProxyEngine(bridge: _bridge);
     _store = widget.settingsStoreOverride ?? SettingsStore(_bridge);
-    _loadSettings();
+    if (widget.initialSettings != null) {
+      _settings = widget.initialSettings!;
+      _loaded = true;
+    } else {
+      _settings = const AppSettings();
+      _loaded = false;
+      _loadSettings();
+    }
   }
 
   Future<void> _loadSettings() async {

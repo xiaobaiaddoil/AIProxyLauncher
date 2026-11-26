@@ -41,7 +41,7 @@ jobs:
           cd mobile
           flutter pub get
           flutter analyze
-          flutter test
+          flutter test --timeout 60s
 
   build-android:
     needs: mobile-test
@@ -135,3 +135,4 @@ jobs:
             dist-mobile/AIProxyLauncher-iOS-unsigned.ipa \
             dist-mobile/AIProxyLauncher-iOS-XcodeProject.zip \
             --repo "$GITHUB_REPOSITORY" --clobber
+

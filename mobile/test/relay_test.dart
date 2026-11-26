@@ -63,10 +63,16 @@ void main() {
         client.add(const [0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0]);
         await client.flush();
 
-        final upDone = upstream.listen(
-          client.add,
-          onDone: () => client.close(),
-        ).asFuture<void>();
+        final upDone = upstream.listen(client.add).asFuture<void>().whenComplete(
+          () async {
+            try {
+              await client.flush();
+            } catch (_) {}
+            try {
+              await client.close();
+            } catch (_) {}
+          },
+        );
 
         if (buf.isNotEmpty) {
           upstream.add(Uint8List.fromList(buf));
