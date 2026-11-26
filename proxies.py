@@ -1265,6 +1265,29 @@ def discover_proxies(
     for wl_pid, (wl_name, _wl_family, _wl_cores, wl_exe) in whitelabel.items():
         apps.setdefault(wl_name, wl_exe)
 
+    # Identify GUI shell PIDs that spawn a separate proxy core binary (e.g. baicai.exe -> FlClashCore.exe,
+    # clash-verge.exe -> verge-mihomo.exe). Their random ephemeral ports (e.g. :13113, :6979, :33331) are
+    # internal GUI<->Core IPC sockets; probing them with HTTP can kill FlClash IPC ("socket done")!
+    gui_shell_pids: set[int] = set()
+    for wl_pid, (_wl_name, _wl_family, wl_cores, _wl_exe) in whitelabel.items():
+        if wl_cores:
+            gui_shell_pids.add(wl_pid)
+    gui_shell_exes = {
+        exe.casefold()
+        for prof in PROFILES
+        if prof.win_cores
+        for exe in prof.win_exes
+        if exe.casefold() not in {c.casefold() for c in prof.win_cores}
+    }
+    for pid, (proc_name, _ppid) in processes.items():
+        if proc_name.casefold() in gui_shell_exes:
+            gui_shell_pids.add(pid)
+
+    def _safe_to_probe(pid: int, port: int) -> bool:
+        if pid not in gui_shell_pids:
+            return True
+        return port == sys_port or port in env_ports or port in COMMON_PROXY_PORTS
+
     proxy_pids: dict[int, str] = {}
     for pid in {p for p, _, _ in listeners}:
         label = identify_process_proxy(pid, processes)
@@ -1327,7 +1350,7 @@ def discover_proxies(
     probe_candidates: list[tuple[int, str, int]] = []
     seen_probe_ports: set[int] = set()
     for pid, _ip, port in listeners:
-        if pid not in proxy_pids or port in known_controller_ports or port in seen_probe_ports:
+        if pid not in proxy_pids or port in known_controller_ports or port in seen_probe_ports or not _safe_to_probe(pid, port):
             continue
         seen_probe_ports.add(port)
         probe_candidates.append((port, proxy_pids[pid], pid))
@@ -1441,7 +1464,7 @@ def discover_proxies(
     # Sort process listening ports so known default ports come before arbitrary internal ports
     proc_candidates: list[tuple[int, int, str, int]] = []
     for pid, _ip, port in listeners:
-        if pid not in proxy_pids or port in seen_http_ports or port in discovered_controller_ports:
+        if pid not in proxy_pids or port in seen_http_ports or port in discovered_controller_ports or not _safe_to_probe(pid, port):
             continue
         label = proxy_pids[pid]
         profile = PROFILE_BY_NAME.get(label)

@@ -986,15 +986,18 @@ Active Routes:
                     20: ("clash-verge.exe", 1),
                     21: ("verge-mihomo.exe", 20),
                 }
-                listeners = [(10, "127.0.0.1", 6979), (21, "127.0.0.1", 7897)]
+                listeners = [(10, "127.0.0.1", 13113), (21, "127.0.0.1", 7897)]
+                probed_ports: list[int] = []
                 with patch.object(proxies, "process_executable_path", side_effect=lambda pid: exe if pid == 10 else None):
                     snap = proxies.discover_proxies(
                         procs, listeners, sys_port=7890, env_ports=[], static_controllers=[],
                         is_mac=False, detected_apps={"Clash Verge Rev": None},
-                        probe_controller=lambda port, label: (None, False),
+                        probe_controller=lambda port, label: (probed_ports.append(port) or None, False),
                     )
                 self.assertIn("白菜机场", snap.detected_apps)
-                self.assertFalse(any(h.port == 7890 for h in snap.http_proxies))
+                # Must NEVER probe or select GUI shell random IPC port 13113 (prevents FlClash 'socket done'!)
+                self.assertNotIn(13113, probed_ports)
+                self.assertFalse(any(h.port in {7890, 13113} for h in snap.http_proxies))
                 self.assertTrue(any("白菜机场" in hint and "7890" in hint and "内核未启动" in hint for hint in snap.hints))
 
                 # Case 2: FlClashCore.exe IS running as child of baicai.exe on :7890 -> labeled as 白菜机场!
