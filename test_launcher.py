@@ -19,6 +19,7 @@ class CheckTests(unittest.TestCase):
         self.enterContext(patch.object(app, "IS_MAC", False))
         self.enterContext(patch.object(repair, "IS_MAC", False))
         self.enterContext(patch.object(repair, "system_proxy_port", return_value=None))
+        self.enterContext(patch.object(app, "detect_system_tun", return_value=False))
         self.enterContext(patch.object(proxies, "probe_exit_region", return_value=("", None)))
 
     def test_antigravity_covers_the_login_and_daily_model_endpoints(self):
@@ -961,6 +962,111 @@ Active Routes:
                     root.destroy()
                 except tk.TclError:
                     pass
+
+    def test_whitelabel_skeleton_detection_and_dead_sys_proxy_diagnosis(self):
+        import win32net
+
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "baicai"
+            folder.mkdir()
+            exe = folder / "baicai.exe"
+            exe.touch()
+            (folder / "FlClashCore.exe").touch()
+            (folder / "proxy_plugin.dll").touch()
+
+            with patch.object(proxies, "_WHITELABEL_CACHE", {}), \
+                    patch.object(win32net, "pe_display_name", return_value="白菜机场"):
+                info = proxies.detect_whitelabel_proxy(exe, is_mac=False)
+                self.assertEqual(info, ("白菜机场", "FlClash", ("flclashcore.exe", "flclashcore")))
+
+                # Case 1: baicai.exe running WITHOUT FlClashCore.exe, Windows sys_port=7890 is dead (not in listeners)
+                # Must NOT misattribute dead :7890 to Clash Verge Rev and MUST emit precise diagnostic hint!
+                procs = {
+                    10: ("baicai.exe", 1),
+                    20: ("clash-verge.exe", 1),
+                    21: ("verge-mihomo.exe", 20),
+                }
+                listeners = [(10, "127.0.0.1", 6979), (21, "127.0.0.1", 7897)]
+                with patch.object(proxies, "process_executable_path", side_effect=lambda pid: exe if pid == 10 else None):
+                    snap = proxies.discover_proxies(
+                        procs, listeners, sys_port=7890, env_ports=[], static_controllers=[],
+                        is_mac=False, detected_apps={"Clash Verge Rev": None},
+                        probe_controller=lambda port, label: (None, False),
+                    )
+                self.assertIn("白菜机场", snap.detected_apps)
+                self.assertFalse(any(h.port == 7890 for h in snap.http_proxies))
+                self.assertTrue(any("白菜机场" in hint and "7890" in hint and "内核未启动" in hint for hint in snap.hints))
+
+                # Case 2: FlClashCore.exe IS running as child of baicai.exe on :7890 -> labeled as 白菜机场!
+                procs_running = {**procs, 11: ("FlClashCore.exe", 10)}
+                listeners_running = [*listeners, (11, "127.0.0.1", 7890)]
+                with patch.object(proxies, "process_executable_path", side_effect=lambda pid: exe if pid == 10 else None):
+                    snap2 = proxies.discover_proxies(
+                        procs_running, listeners_running, sys_port=7890, env_ports=[], static_controllers=[],
+                        is_mac=False, detected_apps={},
+                        probe_controller=lambda port, label: (None, False),
+                    )
+                self.assertTrue(any(h.port == 7890 and h.name == "白菜机场" for h in snap2.http_proxies))
+
+    def test_protocol_first_common_port_discovery_and_wildcard_pipe(self):
+        # Unknown renamed proxy NOT setting system proxy, listening on common proxy port 15732
+        procs = {50: ("mystery_accel.exe", 1)}
+        listeners = [(50, "127.0.0.1", 15732)]
+        probed = []
+
+        def fake_ctrl_probe(port, label):
+            probed.append((port, label))
+            return (app.Controller(port=port, name=label), False) if port == 15732 else (None, False)
+
+        with patch.object(proxies, "scan_whitelabel_processes", return_value={}):
+            snap = proxies.discover_proxies(
+                procs, listeners, sys_port=None, env_ports=[], static_controllers=[],
+                is_mac=False, detected_apps={}, probe_controller=fake_ctrl_probe,
+            )
+        self.assertTrue(any(p == 15732 for p, _ in probed))
+        self.assertTrue(any(c.port == 15732 for c in snap.controllers))
+
+        # Wildcard unknown named pipe (e.g. baicai-mihomo) returning /version JSON is auto-discovered
+        with patch.object(proxies, "sys", type("S", (), {"platform": "win32"})()), \
+                patch.object(proxies.os, "listdir", return_value=["baicai-mihomo", "baicai-service"]), \
+                patch.object(proxies, "probe_pipe_controller", side_effect=lambda p: p == "baicai-mihomo"):
+            pipes = proxies.windows_active_proxy_pipes({})
+        self.assertEqual([c.pipe for c in pipes], ["baicai-mihomo"])
+
+    def test_pure_tun_portless_fallback_and_closed_port_timeout_fix(self):
+        # 1. TCP connect timeout must classify as 'closed', NEVER 'http_proxy'
+        with patch.object(app.socket, "create_connection", side_effect=TimeoutError("SYN timeout")):
+            self.assertEqual(app.probe_http_proxy_port(7890, timeout=1.5), "closed")
+
+        # 2. Pure-TUN mode (port=0) strips proxy env & avoids --proxy-server=:0
+        env = app.proxy_env(0, {"HTTP_PROXY": "http://127.0.0.1:9674", "KEEP": "1"})
+        self.assertNotIn("HTTP_PROXY", env)
+        self.assertEqual(env["KEEP"], "1")
+        self.assertEqual(app.chromium_args(0), ["--disable-quic"])
+
+        with tempfile.TemporaryDirectory() as temp, patch.object(app.subprocess, "Popen") as popen:
+            root = Path(temp)
+            edge = root / "msedge.exe"
+            edge.touch()
+            app.launch(app.TARGETS["chatgpt"], edge, 0, root)
+            cmd = popen.call_args.args[0]
+            self.assertIn(f"--user-data-dir={root / 'Browser' / 'msedge-tun'}", cmd)
+            self.assertFalse(any(arg.startswith("--proxy-server=") for arg in cmd))
+
+        # 3. check_reports falls back to check_tun_only when OS TUN is active with non-CN exit
+        empty_snap = proxies.DiscoverySnapshot(detected_apps={}, controllers=(), http_proxies=(), controller_sibling_ports={}, hints=())
+        good_probe = app.Probe("chatgpt.com", True, "HTTP 200", "tun_route", 110, "", "US")
+        with patch.object(app, "discover_live_proxies", return_value=empty_snap), \
+                patch.object(app, "detect_system_tun", return_value=True), \
+                patch.object(app, "_probe_hosts_and_region", return_value=([good_probe], "US", 110)):
+            reports, _ = app.check_reports(["chatgpt.com"], True)
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0].port, 0)
+        self.assertTrue(reports[0].tun)
+
+        # Rejects domestic CN direct traffic even if a TUN adapter exists
+        with patch.object(app, "_probe_hosts_and_region", return_value=([good_probe], "CN", 20)):
+            self.assertIsNone(app.check_tun_only(["chatgpt.com"]))
 
 
 if __name__ == "__main__":

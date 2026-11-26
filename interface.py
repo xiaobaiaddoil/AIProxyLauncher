@@ -731,7 +731,10 @@ class LauncherWindow:
             badge_bg = "#6EE7B7" if report.tun else ("#BAE6FD" if report.endpoint is None else "#C7D2FE")
             badge_fg = "#064E3B" if report.tun else ("#0C4A6E" if report.endpoint is None else "#312E81")
             pinned = self.provider == report.provider
-            tip_lines = [f"{report.provider}  127.0.0.1:{report.port}"]
+            port_text = f":{report.port}" if report.port else ""
+            tip_lines = [
+                f"{report.provider}  127.0.0.1:{report.port}" if report.port else f"{report.provider}  系统 TUN 直通（无本地 HTTP 端口）"
+            ]
             if region_txt:
                 tip_lines.append(f"AI 出口地区：{region_txt}（{report.region}）" + (" — 部分 AI 平台可能限制该地区" if restricted else ""))
             if report.latency_ms is not None:
@@ -741,7 +744,7 @@ class LauncherWindow:
                 self.proxy_pills_frame, report.provider,
                 bg=p["hero_bg"], fill=p["hero_card"], fg=p["hero_text"], dot=dot,
                 outline="#2DD4BF" if pinned else p["hero_border"],
-                secondary=f":{report.port}", secondary_fg="#7DD3FC",
+                secondary=port_text, secondary_fg="#7DD3FC",
                 meta=meta_str, meta_fg="#FBBF24" if restricted else "#94A3B8",
                 badge=badge, badge_bg=badge_bg, badge_fg=badge_fg,
                 font_size=9, bold=True, height=self.px(26), pad_x=self.px(10),
@@ -1216,7 +1219,7 @@ class LauncherWindow:
 
         merged_probes: dict = {}
         for report in available:
-            label = f"{report.provider} :{report.port}"
+            label = f"{report.provider} :{report.port}" if report.port else f"{report.provider} TUN"
             for host, probe in report.probes.items():
                 existing = merged_probes.get(host)
                 if existing is None or (probe.connected and probe.route in PASSING_ROUTES and not (existing[0].connected and existing[0].route in PASSING_ROUTES)):
@@ -1229,10 +1232,14 @@ class LauncherWindow:
                 rname = proxies.region_label(report.region)
                 self.write(f"地区提示：{report.provider} 当前 AI 出口为 {rname}（{report.region}），部分平台可能受限，可点「切换节点」换至美/日/台/新等节点。", "error")
 
-        uncontrolled = [report.provider for report in available if report.endpoint is None]
-        if uncontrolled:
-            names = "、".join(dict.fromkeys(uncontrolled))
+        uncontrolled_http = [report.provider for report in available if report.endpoint is None and report.port > 0]
+        if uncontrolled_http:
+            names = "、".join(dict.fromkeys(uncontrolled_http))
             self.write(f"提示：{names} 未开放 Clash 控制接口，已通过本地 HTTP 代理直接验证连通性。")
+        tun_only = [report.provider for report in available if report.endpoint is None and report.port == 0 and report.tun]
+        if tun_only:
+            names = "、".join(dict.fromkeys(tun_only))
+            self.write(f"提示：{names} 未开放本地 HTTP 端口，已通过系统 TUN 路由直接验证连通性。")
 
         use_relay = self.relay_enabled and self.relay.running and self.relay.port is not None
         opened = []
@@ -1246,10 +1253,11 @@ class LauncherWindow:
             target = self.targets[key]
             report = app_report(target, available, preferred)
             provider = report.provider or self.provider
-            effective_port = self.relay.port if (use_relay and self.relay.port) else report.port
-            if requires_tun(target) and target.kind != "electron":
+            can_relay = use_relay and report.port > 0
+            effective_port = self.relay.port if (can_relay and self.relay.port) else report.port
+            if report.port <= 0 or (requires_tun(target) and target.kind != "electron"):
                 route = f"{provider} TUN"
-            elif use_relay:
+            elif can_relay:
                 route = f"中继 :{effective_port} → {provider}"
             else:
                 route = f"{provider} :{report.port}"

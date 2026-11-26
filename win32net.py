@@ -445,3 +445,61 @@ def set_autostart(enabled: bool, script_path: Path) -> None:
         else:
             MAC_PLIST.unlink(missing_ok=True)
 
+
+# ── Windows PE version info (friendly display name for white-label apps) ──
+
+_GENERIC_PE_NAMES = {
+    "", "electron", "chromium", "flutter", "windows", "application", "app",
+    "microsoft", "python", "node", "node.js",
+}
+
+
+def pe_display_name(exe_path: Path) -> str:
+    """Read ProductName or FileDescription from a Windows PE executable using version.dll."""
+    if sys.platform != "win32":
+        return ""
+    try:
+        path_str = str(exe_path)
+        ver = ctypes.WinDLL("version", use_last_error=True)
+        ver.GetFileVersionInfoSizeW.argtypes = (wintypes.LPCWSTR, ctypes.POINTER(wintypes.DWORD))
+        ver.GetFileVersionInfoSizeW.restype = wintypes.DWORD
+        ver.GetFileVersionInfoW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID)
+        ver.GetFileVersionInfoW.restype = wintypes.BOOL
+        ver.VerQueryValueW.argtypes = (
+            wintypes.LPCVOID, wintypes.LPCWSTR,
+            ctypes.POINTER(wintypes.LPVOID), ctypes.POINTER(wintypes.UINT),
+        )
+        ver.VerQueryValueW.restype = wintypes.BOOL
+
+        dummy = wintypes.DWORD(0)
+        size = ver.GetFileVersionInfoSizeW(path_str, ctypes.byref(dummy))
+        if not size or size > 2 * 1024 * 1024:
+            return ""
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path_str, 0, size, buf):
+            return ""
+
+        # Query translation table for language/codepage pairs
+        lp = wintypes.LPVOID()
+        length = wintypes.UINT(0)
+        langs: list[tuple[int, int]] = []
+        if ver.VerQueryValueW(buf, r"\VarFileInfo\Translation", ctypes.byref(lp), ctypes.byref(length)) and lp.value and length.value >= 4:
+            raw = ctypes.string_at(lp.value, min(length.value, 32))
+            for offset in range(0, len(raw) - 3, 4):
+                lang, cp = struct.unpack_from("<HH", raw, offset)
+                langs.append((lang, cp))
+        langs.extend([(0x0804, 0x04B0), (0x0409, 0x04B0), (0x0409, 0x04E4)])
+
+        for field in ("ProductName", "FileDescription"):
+            for lang, cp in dict.fromkeys(langs):
+                sub = f"\\StringFileInfo\\{lang:04x}{cp:04x}\\{field}"
+                vp = wintypes.LPVOID()
+                vlen = wintypes.UINT(0)
+                if ver.VerQueryValueW(buf, sub, ctypes.byref(vp), ctypes.byref(vlen)) and vp.value and vlen.value > 1:
+                    text = ctypes.wstring_at(vp.value, vlen.value).rstrip("\x00").strip()
+                    if text and text.casefold() not in _GENERIC_PE_NAMES and len(text) <= 40:
+                        return text
+    except Exception:
+        pass
+    return ""
+

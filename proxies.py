@@ -756,22 +756,26 @@ def create_ssl_context() -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
-def probe_exit_region(port: int, timeout: float = 3.5, host: str = "www.cloudflare.com") -> tuple[str, int | None]:
-    """Read proxy exit country code and RTT (ms) via Cloudflare trace through local HTTP CONNECT."""
+def probe_exit_region(port: int | None, timeout: float = 3.5, host: str = "www.cloudflare.com") -> tuple[str, int | None]:
+    """Read proxy exit country code and RTT (ms) via Cloudflare trace through local HTTP CONNECT or direct OS TUN."""
     started = time.perf_counter()
     sock = None
     try:
-        sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
-        sock.settimeout(timeout)
-        sock.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode("ascii"))
-        with sock.makefile("rb") as reader:
-            status = reader.readline(4096).split()
-            for _ in range(32):
-                line = reader.readline(4096)
-                if line == b"\r\n" or not line:
-                    break
-        if len(status) < 2 or status[1] != b"200":
-            return "", None
+        if port is None:
+            sock = socket.create_connection((host, 443), timeout=timeout)
+            sock.settimeout(timeout)
+        else:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+            sock.settimeout(timeout)
+            sock.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n".encode("ascii"))
+            with sock.makefile("rb") as reader:
+                status = reader.readline(4096).split()
+                for _ in range(32):
+                    line = reader.readline(4096)
+                    if line == b"\r\n" or not line:
+                        break
+            if len(status) < 2 or status[1] != b"200":
+                return "", None
         context = create_ssl_context()
         with context.wrap_socket(sock, server_hostname=host) as tls:
             tls.sendall(
@@ -870,6 +874,148 @@ def windows_existing_pipes() -> set[str] | None:
         return None
 
 
+COMMON_PROXY_PORTS: frozenset[int] = frozenset({
+    7890, 7891, 7892, 7893, 7897, 7898, 7899,
+    9090, 9097, 9674, 1080, 1081, 1082,
+    10800, 10801, 10808, 10809, 10810, 10811,
+    12334, 2080, 2081, 20170, 20171, 4780, 4781,
+    15732, 6152, 6153, 8118, 9910,
+})
+
+_NON_PROXY_EXES: frozenset[str] = frozenset({
+    "system", "idle", "registry", "svchost.exe", "services.exe", "lsass.exe",
+    "explorer.exe", "wininit.exe", "csrss.exe", "smss.exe", "spoolsv.exe",
+    "msedge.exe", "chrome.exe", "brave.exe", "vivaldi.exe", "firefox.exe", "arc.exe",
+    "code.exe", "cursor.exe", "windsurf.exe", "antigravity.exe", "antigravity ide.exe",
+    "python.exe", "pythonw.exe", "python3", "node.exe", "node", "java.exe", "javaw.exe",
+    "wechat.exe", "weixin.exe", "qq.exe", "dingtalk.exe", "wpscloudsvr.exe",
+    "aiproxylauncher.exe", "aiproxylauncher", "workbuddy.exe", "claude.exe", "chatgpt.exe",
+})
+
+_WHITELABEL_CACHE: dict[str, tuple[str, str, tuple[str, ...]] | None] = {}
+
+
+def detect_whitelabel_proxy(exe_path: Path, *, is_mac: bool = False) -> tuple[str, str, tuple[str, ...]] | None:
+    """Identify white-label / rebranded proxy clients by their directory skeleton artifacts.
+
+    Returns (friendly_display_name, core_family, expected_core_exes) or None.
+    """
+    cache_key = str(exe_path).casefold()
+    if cache_key in _WHITELABEL_CACHE:
+        return _WHITELABEL_CACHE[cache_key]
+
+    result: tuple[str, str, tuple[str, ...]] | None = None
+    try:
+        low_path = str(exe_path).casefold()
+        if any(seg in low_path for seg in ("\\windows\\", "\\system32\\", "\\windowsapps\\", "/system/", "/usr/bin/", "/usr/sbin/")):
+            _WHITELABEL_CACHE[cache_key] = None
+            return None
+        if exe_path.name.casefold() in _NON_PROXY_EXES:
+            _WHITELABEL_CACHE[cache_key] = None
+            return None
+
+        scan_dirs = [exe_path.parent, exe_path.parent / "resources"]
+        if is_mac:
+            bundle = next((p for p in exe_path.parents if p.suffix.lower() == ".app"), None)
+            if bundle:
+                scan_dirs.extend([bundle / "Contents/MacOS", bundle / "Contents/Resources"])
+        entries: set[str] = set()
+        for folder in dict.fromkeys(scan_dirs):
+            if folder.is_dir():
+                try:
+                    entries.update(name.casefold() for name in os.listdir(folder))
+                except OSError:
+                    continue
+
+        family = ""
+        expected_cores: tuple[str, ...] = ()
+        if (any(e.startswith("flclashcore") for e in entries)
+                or ({"proxy_plugin.dll", "enableloopback.exe"} <= entries)
+                or ("proxy_plugin.dll" in entries and any(e.endswith("helperservice.exe") for e in entries))):
+            family = "FlClash"
+            expected_cores = ("flclashcore.exe", "flclashcore")
+        elif any(e in entries for e in ("verge-mihomo.exe", "verge-mihomo-alpha.exe", "mihomo.exe", "mihomo-alpha.exe", "clash-meta.exe", "libclash.dll", "libclash.so", "libclash.dylib")):
+            family = "Mihomo"
+            expected_cores = ("verge-mihomo.exe", "verge-mihomo-alpha.exe", "mihomo.exe", "mihomo-alpha.exe", "clash-meta.exe", "mihomo", "verge-mihomo")
+        elif any(e in entries for e in ("sing-box.exe", "sing-box")):
+            family = "Sing-box"
+            expected_cores = ("sing-box.exe", "sing-box")
+        elif any(e in entries for e in ("xray.exe", "v2ray.exe", "xray", "v2ray")):
+            family = "Xray"
+            expected_cores = ("xray.exe", "v2ray.exe", "xray", "v2ray")
+
+        if family:
+            friendly = ""
+            if is_mac:
+                import macos
+                friendly = macos.bundle_display_name(exe_path)
+            else:
+                friendly = win32net.pe_display_name(exe_path)
+            if not friendly:
+                friendly = exe_path.stem
+            result = (friendly, family, expected_cores)
+    except OSError:
+        result = None
+
+    _WHITELABEL_CACHE[cache_key] = result
+    return result
+
+
+def scan_whitelabel_processes(
+    processes: dict[int, tuple[str, int]],
+    *,
+    is_mac: bool = False,
+    path_resolver=None,
+) -> dict[int, tuple[str, str, tuple[str, ...], Path]]:
+    """Find running unknown processes that are white-label forks of FlClash/Mihomo/Sing-box/Xray."""
+    resolver = path_resolver or process_executable_path
+    found: dict[int, tuple[str, str, tuple[str, ...], Path]] = {}
+    checked_names: dict[str, tuple[str, str, tuple[str, ...], Path] | None] = {}
+    for pid, (name, _ppid) in processes.items():
+        low = name.casefold()
+        if not low or low in _NON_PROXY_EXES or identify_process_proxy(pid, processes):
+            continue
+        if low in checked_names:
+            hit = checked_names[low]
+            if hit:
+                found[pid] = hit
+            continue
+        exe = resolver(pid)
+        if not exe or not exe.is_file():
+            checked_names[low] = None
+            continue
+        info = detect_whitelabel_proxy(exe, is_mac=is_mac)
+        if info:
+            rec = (info[0], info[1], info[2], exe)
+            checked_names[low] = rec
+            found[pid] = rec
+        else:
+            checked_names[low] = None
+    return found
+
+
+def probe_pipe_controller(pipe: str, timeout: float = 0.6) -> bool:
+    """Verify via native Win32 pipe I/O whether an unknown named pipe speaks Clash/Mihomo REST API."""
+    if sys.platform != "win32":
+        return False
+    try:
+        raw = win32net.pipe_http_request(
+            pipe,
+            b"GET /version HTTP/1.0\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            timeout=timeout,
+            max_bytes=8192,
+        )
+        if not raw:
+            return False
+        head, sep, body = raw.partition(b"\r\n\r\n")
+        if sep and b"200" in head.splitlines()[0]:
+            data = json.loads(body)
+            return isinstance(data, dict) and "version" in data
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
+
+
 def windows_active_proxy_pipes(processes: dict[int, tuple[str, int]]) -> list[Controller]:
     if sys.platform != "win32":
         return []
@@ -878,12 +1024,19 @@ def windows_active_proxy_pipes(processes: dict[int, tuple[str, int]]) -> list[Co
     except OSError:
         return []
     found: list[Controller] = []
+    seen: set[str] = set()
+    wildcard_tokens = ("mihomo", "clash", "flclash", "sing-box", "singbox")
     for entry in entries:
         folded = entry.casefold()
-        if "service" in folded or not PIPE_NAME.fullmatch(entry):
+        if "service" in folded or not PIPE_NAME.fullmatch(entry) or folded in seen:
             continue
         if any(token in folded for token, _ in PROXY_PIPE_PATTERNS):
+            seen.add(folded)
             found.append(Controller(pipe=entry, name=pipe_display_name(entry, processes)))
+        elif any(tok in folded for tok in wildcard_tokens) and probe_pipe_controller(entry):
+            seen.add(folded)
+            friendly = entry.split("\\")[0].replace("-mihomo", "").replace("_mihomo", "").strip() or "Clash"
+            found.append(Controller(pipe=entry, name=friendly))
     return found
 
 
@@ -1068,6 +1221,8 @@ def detected_proxy_apps(processes: dict[int, tuple[str, int]] | None = None, is_
                 if profile and exe_name.casefold() in {e.casefold() for e in profile.win_exes}:
                     exe_path = process_executable_path(pid)
                 found[label] = exe_path or found.get(label)
+        for _wl_pid, (wl_name, _wl_family, _wl_cores, wl_exe) in scan_whitelabel_processes(processes, is_mac=False).items():
+            found.setdefault(wl_name, wl_exe)
     return found
 
 
@@ -1105,12 +1260,30 @@ def discover_proxies(
         sys_port = None
     env_ports = [p for p in env_ports if p not in excluded]
 
-    # Determine PIDs that belong to known proxy processes OR own system/env proxy ports
+    # Determine PIDs that belong to known proxy processes, white-label forks, or own system/env/common proxy ports
+    whitelabel = scan_whitelabel_processes(processes, is_mac=is_mac)
+    for wl_pid, (wl_name, _wl_family, _wl_cores, wl_exe) in whitelabel.items():
+        apps.setdefault(wl_name, wl_exe)
+
     proxy_pids: dict[int, str] = {}
     for pid in {p for p, _, _ in listeners}:
         label = identify_process_proxy(pid, processes)
         if label:
+            # If a known core (e.g. FlClashCore.exe) was spawned by a white-label GUI, prefer the white-label brand name
+            parent = processes.get(pid, ("", 0))[1]
+            if parent in whitelabel:
+                label = whitelabel[parent][0]
             proxy_pids[pid] = label
+        elif pid in whitelabel:
+            proxy_pids[pid] = whitelabel[pid][0]
+
+    # Protocol-first: also inspect any unknown non-system process listening on a common proxy port
+    for pid, _ip, port in listeners:
+        if pid in proxy_pids or port not in COMMON_PROXY_PORTS:
+            continue
+        proc_name = processes.get(pid, ("", 0))[0].casefold()
+        if proc_name and proc_name not in _NON_PROXY_EXES:
+            proxy_pids[pid] = fallback_process_label(pid, processes, f"本机代理 :{port}")
 
     sys_pids: set[int] = set()
     for special_port, fallback_name in [
@@ -1216,6 +1389,8 @@ def discover_proxies(
 
     def infer_port_label(port: int, owning_pid: int | None, fallback: str) -> str:
         if owning_pid:
+            if owning_pid in proxy_pids:
+                return proxy_pids[owning_pid]
             return fallback_process_label(owning_pid, processes, fallback)
         # When TUN core runs as root on macOS, non-root lsof cannot see its listening PID;
         # match against running proxy profiles' well-known default ports first.
@@ -1225,10 +1400,38 @@ def discover_proxies(
                 return name
         return fallback
 
+    running_names_low = {name.casefold() for name, _ in processes.values()}
+    idle_whitelabel: list[tuple[str, str]] = []
+    for _wl_pid, (wl_name, wl_family, wl_cores, _wl_exe) in whitelabel.items():
+        if wl_cores and not any(c in running_names_low for c in wl_cores):
+            if (wl_name, wl_family) not in idle_whitelabel:
+                idle_whitelabel.append((wl_name, wl_family))
+
     if sys_port:
         owning_pid = port_pids.get(sys_port, [None])[0]
-        label = infer_port_label(sys_port, owning_pid, "系统代理")
-        add_http(sys_port, label, "system", owning_pid)
+        # On Windows, GetExtendedTcpTable sees all listening PIDs (including SYSTEM).
+        # If listeners were populated and sys_port is NOT listening at all, do NOT misattribute a dead port.
+        if not is_mac and listeners and owning_pid is None:
+            if idle_whitelabel:
+                wl_name, wl_family = idle_whitelabel[0]
+                hints.append(
+                    f"系统代理指向 127.0.0.1:{sys_port} 但当前无人监听；"
+                    f"检测到「{wl_name}」（{wl_family} 内核）外壳在运行但代理内核未启动，"
+                    "请检查套餐流量或先关闭其他代理的 TUN 冲突。"
+                )
+            else:
+                hints.append(
+                    f"系统代理指向 127.0.0.1:{sys_port}，但当前没有任何进程监听该端口，"
+                    "请确认对应代理软件已真正连接节点。"
+                )
+        else:
+            label = infer_port_label(sys_port, owning_pid, "系统代理")
+            add_http(sys_port, label, "system", owning_pid)
+    elif idle_whitelabel:
+        for wl_name, wl_family in idle_whitelabel:
+            hints.append(
+                f"检测到「{wl_name}」（{wl_family} 套壳客户端）正在运行，但其代理内核尚未启动或未开放本地端口。"
+            )
 
     for port in env_ports:
         owning_pid = port_pids.get(port, [None])[0]

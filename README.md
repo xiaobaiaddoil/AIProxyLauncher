@@ -19,7 +19,7 @@
 
 ## 核心特性
 
-- **通用代理自动适配**：支持 Clash Verge Rev、Clash Party / Mihomo Party、JImmm、FlClash、Clash Nyanpasu、Sparkle、ClashX、Stash、Surge、v2rayN、Hiddify、NekoBox / Throne、Karing、Shadowsocks、Xray / Sing-box 等 20+ 代理客户端；任何开启系统代理或本地 HTTP 端口的未知客户端均可自动发现，并保留「手动指定端口」兜底模式。
+- **通用代理与套壳客户端全自动适配**：支持 Clash Verge Rev、Clash Party / Mihomo Party、JImmm、FlClash、Clash Nyanpasu、Sparkle、ClashX、Stash、Surge、v2rayN、Hiddify、NekoBox / Throne、Karing、Shadowsocks、Xray / Sing-box 等 20+ 代理客户端；内置**目录骨架指纹识别 + PE/Info.plist 品牌名读取 + 协议优先端口/管道嗅探 + 纯 TUN 无端口直通兜底**，各类改名套壳机场客户端无需硬编码即可自动识别，死系统代理端口与内核未启动冲突自动精准提示，并保留「手动指定端口」兜底模式。
 - **统一本地中继（换代理免重启、网页免重登）**：内置严格仅监听 `127.0.0.1:17890` 的纯标准库 HTTP/CONNECT 中继层（[relay.py](relay.py)）。开启后独立网页窗口共用持久化资料目录（换代理软件不再掉登录），后台按目标域名热切换上游与 `350ms` 快速故障转移，无可用上游时严格返回 `HTTP 502` 绝不直连泄漏。
 - **按服务精准识别出口节点与真实地区**：直连 `chatgpt.com` / `claude.ai` 等目标域名检测出口，并从 Clash `/connections` 提取每个服务实际命中的出站节点名与延迟；遇受限地区自动高亮提醒并在择优与换节点时自动避开。
 - **零子进程原生底层通信（Windows）**：通过 `ctypes` 直接调用 Win32 异步重叠命名管道与 `iphlpapi.GetExtendedTcpTable` 内核 TCP 表（[win32net.py](win32net.py)），告别 `powershell.exe` / `netstat.exe` 轮询开销，毫秒级刷新。

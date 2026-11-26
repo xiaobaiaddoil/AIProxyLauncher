@@ -61,6 +61,23 @@ def find_bundle(*names: str) -> Path | None:
     return None
 
 
+def bundle_display_name(path: Path) -> str:
+    """Read CFBundleDisplayName or CFBundleName from a macOS .app bundle."""
+    bundle = path if path.suffix.lower() == ".app" else next((p for p in path.parents if p.suffix.lower() == ".app"), None)
+    if bundle is None:
+        return ""
+    try:
+        with (bundle / "Contents/Info.plist").open("rb") as source:
+            info = plistlib.load(source)
+        for key in ("CFBundleDisplayName", "CFBundleName"):
+            val = info.get(key)
+            if isinstance(val, str) and val.strip() and val.strip().casefold() not in {"electron", "flutter", "app"}:
+                return val.strip()[:40]
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        pass
+    return bundle.stem
+
+
 def executable(path: Path) -> Path:
     if path.is_file() and path.suffix.lower() != ".app":
         return path
@@ -164,6 +181,9 @@ def sockets() -> list[tuple[str, Path]]:
             ("jimmm*.sock", "JImmm"),
             ("Jimmm*.sock", "JImmm"),
             ("mihomo*.sock", party_label),
+            ("*clash*.sock", "Clash"),
+            ("*mihomo*.sock", party_label),
+            ("*sing*.sock", "sing-box"),
         ):
             try:
                 paths.extend((label, path) for path in sorted(root.glob(pattern))[:8])
@@ -351,7 +371,10 @@ def launch(target, path: Path | None, port: int, data_dir: Path, check_running: 
     if target.kind == "codex":
         if check_running and application_running(path, binary):
             raise AlreadyRunningError("ChatGPT / Codex 已在运行。请保存工作，按 ⌘Q 退出，再从启动器打开。")
-        with_codex_proxy(port, lambda: open_app(path))
+        if port > 0:
+            with_codex_proxy(port, lambda: open_app(path))
+        else:
+            open_app(path)
         return
     if target.kind == "store":
         open_app(path)
@@ -364,7 +387,7 @@ def launch(target, path: Path | None, port: int, data_dir: Path, check_running: 
     elif target.kind == "web":
         if path.stem not in BROWSERS and binary.name not in BROWSERS:
             raise ValueError("请选择 Chrome、Edge、Brave、Arc 或 Vivaldi 等 Chromium 浏览器")
-        profile_name = f"{path.stem}-relay" if stable_profile else f"{path.stem}-{port}"
+        profile_name = f"{path.stem}-tun" if port <= 0 else (f"{path.stem}-relay" if stable_profile else f"{path.stem}-{port}")
         profile = data_dir / "Browser" / profile_name
         profile.mkdir(parents=True, exist_ok=True)
         args.extend(chromium_args(port))

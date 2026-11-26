@@ -148,14 +148,17 @@ def parse_port(value: str) -> int:
 
 def proxy_env(port: int, base=None) -> dict[str, str]:
     base = os.environ if base is None else base
-    proxy = f"http://127.0.0.1:{port}"
     keys = {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"}
     env = {key: value for key, value in base.items() if key.upper() not in keys}
-    env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, ALL_PROXY=proxy, NO_PROXY="localhost,127.0.0.1,::1")
+    if port > 0:
+        proxy = f"http://127.0.0.1:{port}"
+        env.update(HTTP_PROXY=proxy, HTTPS_PROXY=proxy, ALL_PROXY=proxy, NO_PROXY="localhost,127.0.0.1,::1")
     return env
 
 
 def chromium_args(port: int) -> list[str]:
+    if port <= 0:
+        return ["--disable-quic"]
     return [f"--proxy-server=http://127.0.0.1:{port}", "--proxy-bypass-list=localhost;127.0.0.1;[::1]", "--disable-quic"]
 
 
@@ -724,8 +727,14 @@ def probe_http_proxy_port(port: int, test_host: str = "accounts.google.com", tim
     """Classify a local listening port as 'http_proxy', 'socks5', 'not_proxy', or 'closed'."""
     host = test_host.split("/", 1)[0]
     authority = f"{host}:443"
+    # Phase 1: loopback TCP connect succeeds in <2ms when alive; timeout here means port is closed/unresponsive!
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+        sock = socket.create_connection(("127.0.0.1", port), timeout=min(0.6, timeout))
+    except OSError:
+        return "closed"
+    # Phase 2: send HTTP CONNECT and classify response
+    try:
+        with sock:
             sock.settimeout(timeout)
             sock.sendall(f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode("ascii"))
             with sock.makefile("rb") as reader:
@@ -740,8 +749,6 @@ def probe_http_proxy_port(port: int, test_host: str = "accounts.google.com", tim
                 return "not_proxy"
             return "http_proxy"
         return "socks5" if proxies.probe_socks5_port(port) else "not_proxy"
-    except ConnectionRefusedError:
-        return "closed"
     except TimeoutError:
         return "http_proxy"
     except OSError:
@@ -858,7 +865,7 @@ def connect_probe(service: str, port: int | None, timeout: float = 8, endpoint: 
     return Probe(service, False, detail)
 
 
-def probe_with_retry(host: str, port: int, endpoint: Controller | None, *, allow_uncontrolled: bool = False) -> Probe:
+def probe_with_retry(host: str, port: int | None, endpoint: Controller | None, *, allow_uncontrolled: bool = False) -> Probe:
     kwargs = {"endpoint": endpoint}
     if allow_uncontrolled:
         kwargs["allow_uncontrolled"] = True
@@ -894,7 +901,7 @@ def _controller_ports(config: dict, endpoint: Controller,
     return []
 
 
-def _probe_hosts_and_region(hosts: list[str], port: int, endpoint: Controller | None,
+def _probe_hosts_and_region(hosts: list[str], port: int | None, endpoint: Controller | None,
                             *, allow_uncontrolled: bool = False) -> tuple[list[Probe], str, int | None]:
     # Probe per-AI-domain Cloudflare trace (chatgpt.com / claude.ai) when those domains are checked,
     # rather than relying only on www.cloudflare.com which can sit in a different rule group!
@@ -955,6 +962,18 @@ def check_http_proxy(port: int, hosts: list[str], provider: str, *, tun: bool | 
     probes, region, latency_ms = _probe_hosts_and_region(hosts, port, None, allow_uncontrolled=True)
     return Report(
         "http", tun, {probe.host: probe for probe in probes}, port,
+        provider=provider, endpoint=None, region=region, latency_ms=latency_ms,
+    )
+
+
+def check_tun_only(hosts: list[str], provider: str = "系统 TUN") -> Report | None:
+    """Validate pure-TUN proxy setups that expose no local HTTP port (common in white-label clients)."""
+    probes, region, latency_ms = _probe_hosts_and_region(hosts, None, None, allow_uncontrolled=True)
+    connected = [p for p in probes if p.connected and p.route in PASSING_ROUTES]
+    if not connected or region.upper() == "CN":
+        return None
+    return Report(
+        "tun", True, {probe.host: probe for probe in probes}, 0,
         provider=provider, endpoint=None, region=region, latency_ms=latency_ms,
     )
 
@@ -1165,6 +1184,10 @@ def check_reports(hosts: list[str], needs_tun: bool, custom: Controller | None =
             ))
 
     reports = [report for report in (*controller_reports, *http_reports) if not report.issue]
+    if not reports and detect_system_tun():
+        tun_report = check_tun_only(hosts, "系统 TUN")
+        if tun_report is not None:
+            reports.append(tun_report)
     for report in reports:
         detected.setdefault(report.provider, None)
     return reports, tuple(detected)
@@ -1354,7 +1377,10 @@ def write_bytes(path: Path, data: bytes) -> None:
 def launch_codex(target: Target, port: int) -> None:
     if process_running("ChatGPT.exe"):
         raise AlreadyRunningError("ChatGPT / Codex 已在运行。请保存工作并彻底退出，再点「打开」切换代理。")
-    with_codex_proxy(port, lambda: subprocess.Popen([str(WINDOWS / "explorer.exe"), f"shell:AppsFolder\\{target.app_id}"]))
+    if port > 0:
+        with_codex_proxy(port, lambda: subprocess.Popen([str(WINDOWS / "explorer.exe"), f"shell:AppsFolder\\{target.app_id}"]))
+    else:
+        subprocess.Popen([str(WINDOWS / "explorer.exe"), f"shell:AppsFolder\\{target.app_id}"])
 
 
 def with_codex_proxy(port: int, start) -> None:
@@ -1415,7 +1441,7 @@ def launch(target: Target, path: Path | None, port: int, data_dir: Path = DATA, 
     if target.kind == "web":
         if path.name.casefold() not in SUPPORTED_WIN_BROWSERS:
             raise ValueError("请选择 Edge、Chrome、Brave、Vivaldi、Arc 或 Chromium 等 Chromium 内核浏览器。")
-        profile_name = f"{path.stem}-relay" if stable_profile else f"{path.stem}-{port}"
+        profile_name = f"{path.stem}-tun" if port <= 0 else (f"{path.stem}-relay" if stable_profile else f"{path.stem}-{port}")
         profile = data_dir / "Browser" / profile_name
         profile.mkdir(parents=True, exist_ok=True)
         args.extend(chromium_args(port))
