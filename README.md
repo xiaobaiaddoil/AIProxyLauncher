@@ -59,6 +59,8 @@
 | **Windows (x64)** | `AIProxyLauncher.exe` | 单文件绿色版，双击即用，无需安装 Python |
 | **macOS (Apple Silicon)** | `AIProxyLauncher-macOS-arm64.zip` | 解压后双击 `AIProxyLauncher.app`（已内置自动加载 macOS 系统根证书） |
 | **macOS (通用源码包)** | `AIProxyLauncher-macOS-Source.zip` | 兼容 Intel & Apple Silicon，需 Python 3.11+（带 Tk），双击 `macos-start.command` 运行 |
+| **Android (手机版)** | `AIProxyLauncher-Android.apk` | 独立原生 Flutter App，直接安装即用（详见 [mobile/README.md](mobile/README.md)） |
+| **iOS (手机版)** | `AIProxyLauncher-iOS-unsigned.ipa` / `XcodeProject.zip` | 支持 TrollStore / AltStore / 自签或 Xcode 真机编译（详见 [mobile/README.md](mobile/README.md)） |
 
 详细使用与排查请参阅：[Windows 使用说明](使用说明.md) ｜ [macOS 使用说明](macOS使用说明.md)
 
