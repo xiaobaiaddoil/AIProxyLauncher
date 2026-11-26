@@ -1417,7 +1417,7 @@ def discover_proxies(
                 hints.append(
                     f"系统代理指向 127.0.0.1:{sys_port} 但当前无人监听；"
                     f"检测到「{wl_name}」（{wl_family} 内核）外壳在运行但代理内核未启动，"
-                    "请检查套餐流量或先关闭其他代理的 TUN 冲突。"
+                    "请右键以管理员身份运行该软件（或先关闭其 TUN 模式测试）、检查套餐流量，并关闭其他代理的 TUN 冲突。"
                 )
             else:
                 hints.append(

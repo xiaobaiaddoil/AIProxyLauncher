@@ -1034,9 +1034,43 @@ Active Routes:
         self.assertEqual([c.pipe for c in pipes], ["baicai-mihomo"])
 
     def test_pure_tun_portless_fallback_and_closed_port_timeout_fix(self):
+        import socket
+        import threading
+
         # 1. TCP connect timeout must classify as 'closed', NEVER 'http_proxy'
         with patch.object(app.socket, "create_connection", side_effect=TimeoutError("SYN timeout")):
             self.assertEqual(app.probe_http_proxy_port(7890, timeout=1.5), "closed")
+
+        # 1b. Silent non-HTTP binary IPC port (like Flutter/FlClash UI IPC :12937) must classify as 'not_proxy'
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(4)
+        ipc_port = srv.getsockname()[1]
+        stop = threading.Event()
+
+        def silent_ipc():
+            srv.settimeout(0.2)
+            conns = []
+            while not stop.is_set():
+                try:
+                    c, _ = srv.accept()
+                    conns.append(c)
+                except TimeoutError:
+                    continue
+                except OSError:
+                    break
+            for c in conns:
+                c.close()
+
+        t = threading.Thread(target=silent_ipc, daemon=True)
+        t.start()
+        try:
+            self.assertEqual(app.probe_http_proxy_port(ipc_port, timeout=0.35), "not_proxy")
+        finally:
+            stop.set()
+            srv.close()
+            t.join(timeout=1.0)
 
         # 2. Pure-TUN mode (port=0) strips proxy env & avoids --proxy-server=:0
         env = app.proxy_env(0, {"HTTP_PROXY": "http://127.0.0.1:9674", "KEEP": "1"})

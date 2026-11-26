@@ -723,6 +723,18 @@ def live_routes(paths: dict[str, Path | None], custom: Controller | None,
     return routes
 
 
+def _speaks_http_locally(port: int, timeout: float = 0.5) -> bool:
+    """Distinguish a real HTTP proxy (slow upstream) from a silent non-HTTP binary IPC port."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"GET / HTTP/1.0\r\n\r\n")
+            data = sock.recv(16)
+            return data.upper().startswith(b"HTTP/1.")
+    except OSError:
+        return False
+
+
 def probe_http_proxy_port(port: int, test_host: str = "accounts.google.com", timeout: float = 2.0) -> str:
     """Classify a local listening port as 'http_proxy', 'socks5', 'not_proxy', or 'closed'."""
     host = test_host.split("/", 1)[0]
@@ -750,7 +762,9 @@ def probe_http_proxy_port(port: int, test_host: str = "accounts.google.com", tim
             return "http_proxy"
         return "socks5" if proxies.probe_socks5_port(port) else "not_proxy"
     except TimeoutError:
-        return "http_proxy"
+        # Silent binary IPC ports (e.g. FlClash/Flutter UI IPC) time out on HTTP CONNECT;
+        # only classify as http_proxy if the listener actually responds to a local HTTP request.
+        return "http_proxy" if _speaks_http_locally(port) else "not_proxy"
     except OSError:
         return "socks5" if proxies.probe_socks5_port(port) else "not_proxy"
 
@@ -1184,7 +1198,11 @@ def check_reports(hosts: list[str], needs_tun: bool, custom: Controller | None =
             ))
 
     reports = [report for report in (*controller_reports, *http_reports) if not report.issue]
-    if not reports and detect_system_tun():
+    any_healthy = any(
+        any(p.connected and p.route in PASSING_ROUTES for p in r.probes.values())
+        for r in reports
+    )
+    if not any_healthy and detect_system_tun():
         tun_report = check_tun_only(hosts, "系统 TUN")
         if tun_report is not None:
             reports.append(tun_report)
