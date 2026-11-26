@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+from pathlib import Path
 import sys
 import tkinter as tk
 from tkinter import font as tkfont
@@ -205,6 +206,47 @@ def draw_rounded_rect(
         else:
             items.append(canvas.create_rectangle(x1, y1, x2, y2, fill="", outline=outline, width=width, tags=tags))
     return items
+
+
+_ICON_SIZES = (40, 50, 60)
+_ICON_CACHE: dict[tuple[int, str, int], tk.PhotoImage | None] = {}
+
+
+def icon_asset_path(key: str, size: int = 40) -> Path | None:
+    """Resolve the bundled official RGBA PNG icon closest to the requested pixel size."""
+    bucket = min(_ICON_SIZES, key=lambda s: abs(s - size))
+    roots = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        roots.append(Path(meipass))
+    roots.append(Path(__file__).parent)
+    for root in roots:
+        candidate = root / "icons" / str(bucket) / f"{key}.png"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_app_icon(widget: tk.Misc, key: str, size: int = 40) -> tk.PhotoImage | None:
+    """Load and cache an official PNG icon as a Tk PhotoImage (pure stdlib, zero external deps)."""
+    bucket = min(_ICON_SIZES, key=lambda s: abs(s - size))
+    try:
+        tk_root = widget._root()
+    except Exception:
+        return None
+    cache_key = (id(tk_root), key, bucket)
+    if cache_key in _ICON_CACHE:
+        return _ICON_CACHE[cache_key]
+    path = icon_asset_path(key, bucket)
+    if path is None:
+        _ICON_CACHE[cache_key] = None
+        return None
+    try:
+        photo = tk.PhotoImage(master=tk_root, file=str(path))
+    except (tk.TclError, OSError):
+        photo = None
+    _ICON_CACHE[cache_key] = photo
+    return photo
 
 
 def draw_brand_emblem(canvas: tk.Canvas, cx: float, cy: float, radius: float, bg: str, kind: str, font_obj: tkfont.Font) -> None:
@@ -696,6 +738,7 @@ class AppCard(tk.Canvas):
         self._hovered = False
         self._hover_part = ""
         self._disabled = False
+        self._icon_photo: tk.PhotoImage | None = None
         self._open_box = (0.0, 0.0, 0.0, 0.0)
         self._path_box = (0.0, 0.0, 0.0, 0.0)
 
@@ -825,7 +868,12 @@ class AppCard(tk.Canvas):
         st_fg, st_bg, dot_color = self._status_colors()
 
         ex, ey, ed = self._px(15), self._px(14), self._px(40)
-        draw_brand_emblem(self, ex + ed / 2, ey + ed / 2, ed / 2, self._brand_color, self._icon_kind, self._glyph_font)
+        photo = load_app_icon(self, self.key, ed)
+        self._icon_photo = photo
+        if photo is not None:
+            self.create_image(ex + ed / 2, ey + ed / 2, image=photo)
+        else:
+            draw_brand_emblem(self, ex + ed / 2, ey + ed / 2, ed / 2, self._brand_color, self._icon_kind, self._glyph_font)
         dot_d = self._px(10)
         dx, dy = ex + ed - dot_d + self._px(2), ey + ed - dot_d + self._px(2)
         self.create_oval(dx - 2, dy - 2, dx + dot_d + 2, dy + dot_d + 2, fill=fill, outline="")

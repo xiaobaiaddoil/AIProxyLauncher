@@ -947,6 +947,15 @@ Active Routes:
                 dlg2.confirm_button._command()
                 root.update()
                 self.assertIsNone(win._guide_dialog)
+
+                # Official bundled PNG icons exist and load cleanly for all built-in + preset apps
+                import widgets
+                for key in app.ALL_BUILTIN_TARGETS:
+                    for sz in (40, 50, 60):
+                        path = widgets.icon_asset_path(key, sz)
+                        self.assertIsNotNone(path, f"Missing icon for {key}@{sz}")
+                    photo = widgets.load_app_icon(root, key, 40)
+                    self.assertIsNotNone(photo, f"Failed loading PhotoImage for {key}")
             finally:
                 try:
                     root.destroy()

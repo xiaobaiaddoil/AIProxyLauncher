@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Run tests, build the standalone Windows executable, and refresh the macOS source archive.
 .PARAMETER SourceOnly
@@ -57,6 +57,10 @@ try {
             Copy-Item -LiteralPath $src -Destination $MacBundleDir -Force
         }
     }
+    $IconsDir = Join-Path $Root "icons"
+    if (Test-Path -LiteralPath $IconsDir) {
+        Copy-Item -LiteralPath $IconsDir -Destination (Join-Path $MacBundleDir "icons") -Recurse -Force
+    }
     $MacZip = Join-Path $OutDir "AIProxyLauncher-macOS-Source.zip"
     if (Test-Path -LiteralPath $MacZip) {
         Remove-Item -LiteralPath $MacZip -Force
@@ -101,6 +105,9 @@ try {
     )
     if (Test-Path -LiteralPath $IconPath) {
         $PyArgs += @("--icon", $IconPath, "--add-data", "$IconPath;.")
+    }
+    if (Test-Path -LiteralPath $IconsDir) {
+        $PyArgs += @("--add-data", "$IconsDir;icons")
     }
     $PyArgs += (Join-Path $Root "launcher.py")
     & $Builder @PyArgs

@@ -32,6 +32,9 @@ if [[ -n "${MAC_CODESIGN_IDENTITY:-}" ]]; then
 fi
 args=(--noconfirm --windowed --onedir --name "$app" --osx-bundle-identifier local.aiproxylauncher
       --target-arch "$arch" --distpath "$output" --workpath "$stage/work" --specpath "$stage")
+if [[ -d "$PWD/icons" ]]; then
+    args+=(--add-data "$PWD/icons:icons")
+fi
 if [[ ${#signing[@]} -gt 0 ]]; then
     args+=("${signing[@]}")
 fi
